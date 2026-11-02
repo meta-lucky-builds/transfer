@@ -495,19 +495,9 @@ class CompactBelief(nn.Module):
         joints_valid = step.obs_mask.bool()[:, :JOINTS]
         stand_in = torch.where(step.obs_mask.bool(), torch.nan_to_num(step.observation), predicted)
         view_valid = visual_mask.reshape(B, c.views, c.visual_per_view).all(-1)
-        age = torch.where(view_valid, torch.zeros_like(state.age_s), (state.age_s + step.dt[:, None]).clamp(max=c.age_cap_s))
-        gru_input = torch.cat(
-            [
-                stand_in[:, JOINTS:],
-                torch.where(joints_valid, stand_in[:, :JOINTS], predicted[:, :JOINTS]),
-                command,
-                view_valid.to(command.dtype),
-                age / c.age_cap_s,
-                (step.dt / c.nominal_macro_dt_s)[:, None],
-            ],
-            -1,
-        ).to(state.h.dtype)
-        h = self.history(gru_input, state.h)
+        age = self._advance_age(state.age_s, view_valid, step.dt)
+        joints_in = torch.where(joints_valid, stand_in[:, :JOINTS], predicted[:, :JOINTS])
+        h = self._history_update(state.h, stand_in[:, JOINTS:], joints_in, command, view_valid, age, step.dt)
 
         new_state = BeliefState(log_post, update.mean, update.cov, h, age, regimes)
         valid_step = step.step_valid if step.step_valid is not None else torch.ones(B, dtype=torch.bool, device=h.device)
@@ -529,6 +519,71 @@ class CompactBelief(nn.Module):
             nis=nis,
         )
         return new_state, output
+
+    def _advance_age(self, age_s: torch.Tensor, view_valid: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """Seconds since each view was last actually observed, capped (config age_cap_s)."""
+        return torch.where(view_valid, torch.zeros_like(age_s), (age_s + dt[:, None]).clamp(max=self.config.age_cap_s))
+
+    def _history_update(self, h, visual, joints, command, view_valid, age, dt) -> torch.Tensor:
+        """Eq. 6: h_t = GRU(h_{t-1}, [y~_t visual, p_bar_t, e(U_{t-1}), mask, age, dt]).
+
+        visual and joints are actual observations where valid and prior predicted
+        means elsewhere; view_valid says which. Shared by filtering and imagination,
+        so an imagined step builds exactly the input a fully missing frame would.
+        """
+        c = self.config
+        gru_input = torch.cat(
+            [visual, joints, command, view_valid.to(command.dtype), age / c.age_cap_s, (dt / c.nominal_macro_dt_s)[:, None]],
+            -1,
+        ).to(h.dtype)
+        return self.history(gru_input, h)
+
+    def imagine(
+        self,
+        x: torch.Tensor,
+        h: torch.Tensor,
+        age_s: torch.Tensor,
+        slot: torch.Tensor,
+        regimes: Sequence[int],
+        step: StepInput,
+        noise: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One imagined macro step for sampled particles (spec 7.6, 14.4 steps 2, 5, 6).
+
+        x [N, n] a sampled state at frame t-1, h [N, H] the history after frame t-1,
+        age_s [N, V], slot [N] long index of each particle's regime within `regimes`,
+        noise [N, n] standard normal draws or None for the noiseless mean. step holds
+        the issued block U_{t-1} with its history and dt; its observation is ignored.
+
+            x_t   = F_r(x_{t-1}, h_{t-1}, U_{t-1}, dt) + sqrt(Q_r(dt)) * noise
+            y^_t  = H_r(h_{t-1}, e(U_{t-1})) x_t + b_r          (never a measurement)
+            h_t   = GRU(h_{t-1}, [y^_t flagged missing, e(U_{t-1}), age + dt, dt])
+
+        No measurement update happens: the generated observation enters the history
+        only as the prior stand-in of a missing frame, exactly as predict_only feeds
+        it (a test checks equality for one regime and zero noise). Returns (x_t, h_t,
+        age_t, y^_t). Regime switching between steps is the caller's job.
+        """
+        check_full_precision(x.device)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            c = self.config
+            N, n = x.shape
+            K = len(regimes)
+            if slot.shape != (N,) or int(slot.min()) < 0 or int(slot.max()) >= K:
+                raise ValueError("slot needs one regime index per particle, below len(regimes)")
+            command = self.encode_commands(step)
+            rows = torch.arange(N, device=x.device)
+            every = self.transition(x[:, None].expand(N, K, n), h, command, step.dt, step.issued, step.tick_dt, regimes)
+            mean = every[rows, slot]
+            if noise is not None:
+                variance = self.process_variance(regimes, step.dt)[rows, slot]
+                mean = mean + variance.sqrt() * noise
+            matrix, bias = self.observation_model(h, command, regimes)
+            predicted = (matrix[rows, slot] @ mean[..., None]).squeeze(-1) + bias[rows, slot]
+            view_valid = torch.zeros(N, c.views, dtype=torch.bool, device=x.device)
+            age = self._advance_age(age_s, view_valid, step.dt)
+            h_next = self._history_update(h, predicted[:, JOINTS:], predicted[:, :JOINTS], command, view_valid, age, step.dt)
+            return mean, h_next, age, predicted
 
     def predict_only(self, state: BeliefState, step: StepInput) -> tuple[BeliefState, StepOutput]:
         """Imagination / prediction through a gap: no coordinate is assimilated (spec 7.6).
