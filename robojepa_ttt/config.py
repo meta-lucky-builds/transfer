@@ -115,3 +115,72 @@ def load_settings(path: str | os.PathLike = Path(__file__).resolve().parents[1] 
         microbatch=planning["microbatch_initial"],
     )
     return Settings(online_config, offline_config, promotion_config, replay_config, cem_config, raw)
+
+
+def compact_config(settings: Settings, joint_sensor_std=None, residual_bound=None, view_ids=None):
+    """CompactConfig from the YAML `belief` section, cross-checked against its own dimensions.
+
+    joint_sensor_std and residual_bound are measured hardware values. They come from
+    the arguments, else from robot.joint_sensor_std_normalized and
+    robot.residual_joint_bound_normalized, and are refused when absent rather than
+    defaulted (spec 6.4, 6.5).
+    """
+    from .belief.compact import CompactConfig
+    from .belief.imm import JitterPolicy
+
+    raw = settings.raw
+    belief, robot, sketch = raw["belief"], raw["robot"], raw["representation"]["sketch"]
+
+    def six(value, name):
+        if value is None:
+            raise ValueError(f"{name} is a measured value; pass it or set it in config_so101.yaml")
+        values = (float(value),) if isinstance(value, (int, float)) else tuple(float(v) for v in value)
+        if len(values) == 1:
+            values = values * 6
+        if len(values) != 6:
+            raise ValueError(f"{name} needs one or six values")
+        return values
+
+    views = tuple(view_ids) if view_ids is not None else tuple(raw["representation"].get("checkpoint_view_ids") or (6, 1))
+    variance = belief["process_variance_per_macro"]
+    bounds = belief["process_variance_bounds"]
+    config = CompactConfig(
+        joint_sensor_std=six(joint_sensor_std if joint_sensor_std is not None else robot.get("joint_sensor_std_normalized"), "joint_sensor_std"),
+        residual_bound=six(residual_bound if residual_bound is not None else robot.get("residual_joint_bound_normalized"), "residual_bound"),
+        view_ids=views,
+        visual_per_view=sketch["pca_dims_per_view"],
+        fast_dims=belief["fast_dims"],
+        slow_dims=belief["slow_dims"],
+        recurrent_hidden=belief["recurrent_hidden"],
+        command_hidden=belief["command_hidden"],
+        regime_dim=belief["regime_embedding_dim"],
+        max_regimes=belief["max_regimes"],
+        transition_hidden=tuple(belief["mean_transition_hidden"]),
+        observation_hidden=tuple(belief["observation_hidden"]),
+        nominal_macro_dt_s=raw["timing"]["nominal_macro_dt_s"],
+        fast_decay_s=belief["fast_initial_decay_seconds"],
+        fast_coefficient=belief["fast_residual_coefficient_per_macro"],
+        observation_matrix_bound=belief["observation_matrix_initial_bound"],
+        process_variance_init=(variance["joint"], variance["fast"], variance["slow"]),
+        joint_fast_variance_bounds=tuple(bounds["joint_fast"]),
+        slow_variance_bounds=tuple(bounds["slow"]),
+        visual_std_init=belief["visual_initial_observation_std"],
+        initial_latent_variance=belief["initial_fast_variance"],
+        mode_residence_s=belief["mode_residence_prior_seconds"],
+        correction_rank=belief["online_transition_correction"]["rank"],
+        jitter=JitterPolicy(belief["numerical_jitter_initial"], belief["numerical_jitter_max"]),
+    )
+    checks = {
+        "latent_state_dim": config.state_dim,
+        "joint_dims": 6,
+        "command_input_dim": 8,
+    }
+    if len(views) == 2:
+        checks["observation_dim_two_views"] = config.obs_dim
+        checks["recurrent_input_dim"] = config.gru_input_dim
+    for key, value in checks.items():
+        if belief[key] != value:
+            raise ValueError(f"config_so101.yaml belief.{key}={belief[key]} disagrees with the derived {value}")
+    if belief["initial_fast_variance"] != belief["initial_slow_variance"]:
+        raise ValueError("this implementation uses one initial latent variance; make fast and slow equal")
+    return config

@@ -106,8 +106,9 @@ class ObservationSketch(nn.Module):
             if view_id not in frames:
                 raise ValueError(f"no training frames for contract view {view_id}")
             source = frames[view_id]
-            chunks = [source] if isinstance(source, torch.Tensor) else list(source)
-            pooled = torch.cat([pooled_tokens(c.cpu(), self.rows, self.cols) for c in chunks]).double()
+            chunks = [source] if isinstance(source, torch.Tensor) else source
+            # Pool chunk by chunk: full-size raw frames are ~2 MB each, pooled ones 80 kB.
+            pooled = torch.cat([pooled_tokens(c, self.rows, self.cols).cpu() for c in chunks]).double()
             if pooled.shape[0] > max_samples:
                 pooled = pooled[torch.randperm(pooled.shape[0], generator=generator)[:max_samples]]
             count = pooled.shape[0]
