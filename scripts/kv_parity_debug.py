@@ -128,7 +128,13 @@ def main():
     parser.add_argument("--weights", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", default="kv_parity_debug.json")
+    parser.add_argument("--strict-fp32", action="store_true",
+                        help="disable TF32, which NGC containers enable by default; run with NVIDIA_TF32_OVERRIDE=0")
     args = parser.parse_args()
+    if args.strict_fp32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
 
     torch.manual_seed(0)
     model = build_model(
@@ -137,7 +143,17 @@ def main():
     )
     model.set_trainable("none")
     batch = fake_batch(2, 10, args.device)
-    report = {"gpu": torch.cuda.get_device_name(0), "torch": torch.__version__}
+    import os
+
+    report = {
+        "gpu": torch.cuda.get_device_name(0),
+        "torch": torch.__version__,
+        "tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "env_NVIDIA_TF32_OVERRIDE": os.environ.get("NVIDIA_TF32_OVERRIDE"),
+        "env_TORCH_ALLOW_TF32_CUBLAS_OVERRIDE": os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"),
+    }
+    print("precision settings:", json.dumps(report), flush=True)
     report["bf16_vs_fp32_single_forward"] = guarded(precision_single_forward, model, batch, 4)
     print("bf16 vs fp32, one forward:", json.dumps(report["bf16_vs_fp32_single_forward"])[:300], flush=True)
     for label, dtype, context_manager in (
