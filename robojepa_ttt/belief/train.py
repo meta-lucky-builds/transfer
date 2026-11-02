@@ -138,19 +138,19 @@ def sequence_loss(
     value = _sequence_mean(nll, nll_mask)
     if value is not None:
         terms.append(config.weight_nll * value)
-        parts["nll"] = float(value)
+        parts["nll"] = float(value.detach())
     value = _sequence_mean(joint, joint_mask)
     if value is not None:
         terms.append(config.weight_joint * value)
-        parts["joint"] = float(value)
+        parts["joint"] = float(value.detach())
     if "regime" in batch:
         value = _sequence_mean(ce, nll_mask)
         if value is not None:
             terms.append(config.weight_regime_ce * value)
-            parts["regime_ce"] = float(value)
+            parts["regime_ce"] = float(value.detach())
     regularity = model.fast_output_weights().pow(2).mean()
     terms.append(config.weight_regularity * regularity)
-    parts["regularity"] = float(regularity)
+    parts["regularity"] = float(regularity.detach())
     if len(terms) == 1:
         raise ValueError("batch has no scored step with any valid observation")
     loss = sum(terms)
@@ -193,7 +193,7 @@ class CompactTrainer:
         for _ in range(micro):
             loss, parts = sequence_loss(self.model, next_batch(), self.joint_scale, cfg)
             (loss / micro).backward()
-            loss_total += float(loss) / micro
+            loss_total += float(loss.detach()) / micro
             for k, v in parts.items():
                 totals[k] = totals.get(k, 0.0) + v / micro
         params = [p for p in self.model.parameters() if p.requires_grad]

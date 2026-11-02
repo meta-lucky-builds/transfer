@@ -1,6 +1,6 @@
 # TTT layers for RoboJEPA: build status and training guide
 
-This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJEPA with a nominal servo bridge and persistent adaptation of LoRA and token-residual layers. The recurrent belief is not built. It has reserved inputs in the residual, so it can be added later.
+This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJEPA with a nominal servo bridge and persistent adaptation of LoRA and token-residual layers. The compact recurrent belief (baseline B2) is now built in `robojepa_ttt/belief/` and trains on its own. Feeding it into the visual predictor (B4) is not built yet; the residual has reserved inputs for that.
 
 ## What exists
 
@@ -24,6 +24,7 @@ This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJE
 | Six-joint CEM, deterministic | `robojepa_ttt/planning/joint_cem.py` | 14.3 to 14.6 |
 | Dataset import, feature store | `robojepa_ttt/data/` | 10 |
 | Metrics, software shifts, simulated arm | `robojepa_ttt/evaluation/` | 19 |
+| Belief: sketch, IMM-EKF, compact model, training, fixed-lag replay, CUSUM, calibration | `robojepa_ttt/belief/` | 6.2 to 8.2, 9.3 to 9.4, 10.5 |
 
 ## Verification status
 
@@ -85,10 +86,18 @@ This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJE
 
 9. **Online, shadow mode only.** `OnlineRunner` with `shadow=True` predicts, trains and evaluates, and cannot change what the robot runs. Apply `CommandShift` to test adaptation.
 
+10. **Belief (stage 2, spec 10.5).** Fits the observation sketch on training frames only, then trains the compact filter by differentiable filtering. `--joint-sensor-std` is measured joint repeatability in compact units while the arm holds still. On public data it is a placeholder, and the calibration multiplier for joints in `report.json` shows how far off it was. Calibration episodes never give training gradients.
+
+   ```bash
+   python scripts/train_belief.py --units U --servo S --train data/train/episodes --validation data/val/episodes --calibration data/cal/episodes --features data/all/features --views 6 1 --joint-sensor-std 0.002 --out runs/belief
+   ```
+
+   Read `report.json`. `nis_per_coordinate` near 1 per block is a diagnostic, not proof. A `repairs` count above zero in the training log points to a numerical problem to investigate.
+
 ## Remaining work
 
 - **Live robot driver.** It is deliberately not written. It needs measured limits and a commissioned stop policy, which do not exist yet. `OnlineRunner`, `Supervisor`, `JointCem` and `record_session` are the pieces it connects.
-- **Belief.** Compact dynamics, observation model, IMM-EKF, belief-sampled planning and CVaR.
+- **Belief into the visual model (B4).** Feed `[h_t, x_{t+1}]` to the token residual (`belief_dim=320`), drive rollouts with motion predicted by the belief instead of the servo alone, add the compact/full consistency loss, then belief-sampled planning and CVaR.
 - **Regime bank.** Layers are regime-keyed, but detection, mode switching and quarantine promotion are not built.
 - **Foreground and task probes in the gate.** The gate accepts them; they need task labels.
 
