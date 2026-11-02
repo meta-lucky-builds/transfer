@@ -30,9 +30,22 @@ This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJE
 
 **Checked on CPU:** the test suite in `tests/`, run on the real pinned predictor code at tiny size, plus LoRA attachment on the released 300M and 2B architectures at full size without weights.
 
+**Checked on GPU (2026-11-02, released 2B `cooldown_2b_450k`, RTX PRO 6000 Blackwell 96 GB, NGC torch 2.14 nv26.08, bf16):**
+
+| Check | Result |
+|---|---|
+| Weights load | 1.86 B parameters, no missing or unexpected keys |
+| LoRA | 24 projections wrapped (split q/kv layout), gradient reaches it: 5.86 |
+| Memory | 8.1 GB loaded, 24.0 GB peak for one online update of 16 sequences |
+| Online update | 3.66 s median, so 0.027 updates/s at the 10% duty limit |
+| One prediction | 0.15 s |
+| KV cache, true fp32 (TF32 off) | cached versus full relative error 6.7e-6: exact |
+| KV cache, bf16 | 0.53% relative for one step, against 4.9% for bf16 versus fp32 itself; max errors up to ~20 come from huge feature channels and from compounding through fed-back frames on random inputs |
+
+NGC containers enable TF32 by default. The predictor tolerates it; the belief filter does not, and refuses to run with it (`check_full_precision`). Online adaptation at 2B is compute-limited: about 100 updates per hour at 10% duty.
+
 **Not checked yet:**
-- released weights, real features and any real dataset
-- bf16 on CUDA, memory and latency
+- real features and any real dataset; drift of KV rollouts on real features
 - `prepare_lerobot.py` and the event recorder, which have never run against LeRobot or an arm
 - whether adaptation helps on real data. The simulated-arm tests prove that the machinery works, nothing more
 
