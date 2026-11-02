@@ -275,3 +275,28 @@ def test_sketch_contract_masks_missing_views_and_ignores_others():
 def test_sketch_buffers_are_not_parameters():
     sketch = ObservationSketch((6,), token_dim=8, components=2)
     assert list(sketch.parameters()) == []
+
+
+def test_filter_refuses_tf32_on_cuda(monkeypatch):
+    """NGC containers enable TF32 by default; it cost 0.4% relative error on GPU."""
+    from robojepa_ttt.belief.compact import check_full_precision
+
+    cuda = torch.device("cuda")
+    previous = (torch.backends.cuda.matmul.allow_tf32, torch.get_float32_matmul_precision())
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+        check_full_precision(cuda)
+        check_full_precision(torch.device("cpu"))
+        monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "1")
+        with pytest.raises(RuntimeError, match="TF32"):
+            check_full_precision(cuda)
+        monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
+        torch.set_float32_matmul_precision("high")
+        with pytest.raises(RuntimeError, match="precision"):
+            check_full_precision(cuda)
+        check_full_precision(torch.device("cpu"))  # CPU has no TF32
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous[0]
+        torch.set_float32_matmul_precision(previous[1])

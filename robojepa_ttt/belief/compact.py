@@ -37,6 +37,7 @@ Precision. The compact model and filter run in float32 with autocast disabled
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field, replace
 from typing import Optional, Sequence
 
@@ -60,6 +61,32 @@ from .imm import (
 )
 
 JOINTS = 6
+
+
+def check_full_precision(device: torch.device) -> None:
+    """Refuse TF32 for the filter on CUDA (spec 7.3: covariance and solves in fp32).
+
+    TF32 keeps about 10 mantissa bits, so 'fp32' matrix products lose roughly three
+    decimal digits. NVIDIA's NGC containers enable it by default, and their
+    TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 overrides PyTorch's own switch. Measured on
+    an RTX PRO 6000: TF32 left 0.4% relative error where true fp32 gave 7e-6.
+    """
+    if device.type != "cuda":
+        return
+    problems = []
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE") == "1":
+        problems.append("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1")
+    if torch.backends.cuda.matmul.allow_tf32:
+        problems.append("torch.backends.cuda.matmul.allow_tf32=True")
+    if torch.get_float32_matmul_precision() != "highest":
+        problems.append(f"float32 matmul precision '{torch.get_float32_matmul_precision()}'")
+    if problems:
+        raise RuntimeError(
+            "the belief filter needs true fp32 on CUDA, but TF32 is active ("
+            + ", ".join(problems)
+            + "). Start the process with NVIDIA_TF32_OVERRIDE=0 TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0, and call "
+            "torch.backends.cuda.matmul.allow_tf32 = False and torch.set_float32_matmul_precision('highest')."
+        )
 
 
 @dataclass(frozen=True)
@@ -419,6 +446,7 @@ class CompactBelief(nn.Module):
         predict=False is the first frame after initial_state: no transition, and the
         joint rows are masked because that reading already initialised the belief.
         """
+        check_full_precision(state.mean.device)
         with torch.autocast(device_type=state.mean.device.type, enabled=False):
             return self._step(state, step, predict, differentiable_jacobian, compute_nis)
 

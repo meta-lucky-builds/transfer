@@ -20,13 +20,23 @@ small, so its cost is the sequential filter, not the batch.
 
 from __future__ import annotations
 
+import os
+
+# The filter needs true fp32 (spec 7.3). NGC containers turn TF32 on through these
+# variables, which cuBLAS reads when CUDA starts, so they are set before torch loads.
+os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
+
 import argparse
 import json
 import random
-from dataclasses import replace
 from pathlib import Path
 
 import torch
+
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision("highest")
 
 from _common import feature_cache, load_episodes, load_servo, load_units
 from robojepa_ttt.belief.calibration import fit_calibration, innovation_summary
