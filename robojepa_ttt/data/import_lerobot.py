@@ -96,16 +96,18 @@ def split_episodes(
     random.Random(seed).shuffle(sessions)
     if len(sessions) < 4:
         raise ValueError("need at least four sessions for four disjoint splits")
-    edges, total = [], 0.0
-    for fraction in fractions[:-1]:
-        total += fraction
-        edges.append(round(total * len(sessions)))
-    # Every split keeps at least one session.
-    edges[0] = max(edges[0], 1)
-    edges[1] = max(edges[1], edges[0] + 1)
-    edges[2] = min(max(edges[2], edges[1] + 1), len(sessions) - 1)
+    # Every split keeps at least one session. Each remaining session goes to the split
+    # furthest below its target share, so counts always sum to the session total and
+    # no session can land in two splits.
+    targets = [fraction * len(sessions) for fraction in fractions]
+    counts = [1, 1, 1, 1]
+    for _ in range(len(sessions) - 4):
+        neediest = max(range(4), key=lambda i: (targets[i] - counts[i], -i))
+        counts[neediest] += 1
     names = ("train", "validation", "calibration", "test")
-    bounds = [0, *edges, len(sessions)]
+    bounds = [0]
+    for count in counts:
+        bounds.append(bounds[-1] + count)
     return {
         name: [e for s in sessions[bounds[i] : bounds[i + 1]] for e in groups[s]] for i, name in enumerate(names)
     }

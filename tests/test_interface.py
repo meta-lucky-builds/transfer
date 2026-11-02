@@ -270,3 +270,15 @@ def test_session_split_is_disjoint_and_complete():
     assert all(split.values())
     with pytest.raises(ValueError):
         split_episodes({"a": ["1"], "b": ["2"]})
+
+
+@pytest.mark.parametrize("sessions", range(4, 25))
+def test_session_split_never_empties_or_shares_a_split(sessions):
+    """Regression: 4 to 8 sessions left calibration empty, and at 4 or 5 the
+    validation session was also the test session."""
+    groups = {f"s{i}": [f"s{i}-e"] for i in range(sessions)}
+    split = split_episodes(groups)
+    assigned = [e for v in split.values() for e in v]
+    assert all(split.values())
+    assert len(assigned) == len(set(assigned)) == sessions
+    assert len(split["train"]) >= max(len(split[k]) for k in ("validation", "calibration", "test"))
