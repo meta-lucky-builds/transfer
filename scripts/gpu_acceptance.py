@@ -5,6 +5,10 @@ empirical. Writes gpu_acceptance.json.
 
     python scripts/gpu_acceptance.py --predictor-config sources/wm_300m_config.json \
         --weights /path/to/world_model.pth.tar
+
+On a 24 GB card add --microbatch 1 (or 2). The update still covers the full batch of
+16 sequences, split into smaller pieces, so it gives the same result with less memory.
+Timing numbers only describe the card the script ran on.
 """
 
 from __future__ import annotations
@@ -57,12 +61,13 @@ def main():
     parser.add_argument("--weights", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--out", default="gpu_acceptance.json")
+    parser.add_argument("--microbatch", type=int, default=None, help="sequences per pass in the update test")
     args = parser.parse_args()
 
     settings = load_settings()
     units = So101Units(gripper_direction_verified=True)
     servo = ServoParams((0.1,) * 6, (3,) * 6)
-    report = {}
+    report = {"gpu": torch.cuda.get_device_name(0), "microbatch": args.microbatch}
 
     torch.cuda.reset_peak_memory_stats()
     model = build_model(args.predictor_config, args.weights, units, servo, settings, args.device, checkpointing=True)
@@ -89,7 +94,9 @@ def main():
     for _ in range(5):
         torch.cuda.synchronize()
         started = time.perf_counter()
-        result = builder.update(update_batch, [False] * update_batch["features"].shape[0], context=4)
+        result = builder.update(
+            update_batch, [False] * update_batch["features"].shape[0], context=4, microbatch=args.microbatch
+        )
         torch.cuda.synchronize()
         times.append(time.perf_counter() - started)
         assert result.status == "ok"
