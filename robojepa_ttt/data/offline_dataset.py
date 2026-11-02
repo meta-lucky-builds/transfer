@@ -16,6 +16,10 @@ from ..learning.windows import Episode, WindowSpec, sparse_starts
 FIELDS = ("time_s", "position", "issued", "position_valid", "command_valid", "frame_valid", "segment")
 
 
+def episode_filename(episode_id: str) -> str:
+    return f"{hashlib.sha256(episode_id.encode()).hexdigest()[:24]}.npz"
+
+
 def save_episode(episode: Episode, directory: str | os.PathLike, view_ids: list[int]) -> Path:
     """One file per episode, named by its id, written atomically.
 
@@ -24,7 +28,7 @@ def save_episode(episode: Episode, directory: str | os.PathLike, view_ids: list[
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{hashlib.sha256(episode.episode_id.encode()).hexdigest()[:24]}.npz"
+    path = directory / episode_filename(episode.episode_id)
     temporary = path.with_name(path.stem + ".tmp.npz")
     arrays = {name: getattr(episode, name)[: episode.length] for name in FIELDS}
     meta = {

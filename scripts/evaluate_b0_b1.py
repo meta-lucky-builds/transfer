@@ -17,7 +17,7 @@ from dataclasses import asdict
 import numpy as np
 import torch
 
-from _common import build_model, feature_cache, load_episodes, load_servo, load_units
+from _common import build_model, dataset_timing, feature_cache, load_episodes, load_servo, load_units
 from robojepa_ttt.config import load_settings
 from robojepa_ttt.evaluation.prediction import compare_by_episode, rollout_errors, stationary_errors
 from robojepa_ttt.learning.replay import collate_windows
@@ -35,12 +35,13 @@ def main():
     args = parser.parse_args()
 
     settings = load_settings()
-    spec = WindowSpec(frames=args.context + args.horizon)
+    timing = dataset_timing(settings, args.episodes)
+    spec = WindowSpec(frames=args.context + args.horizon, stride=timing.stride, tick_s=timing.tick_s, history_ticks=timing.history_ticks)
     episodes, view_ids = load_episodes(args.episodes)
     lookup = {e.episode_id: e for e in episodes}
     cache = feature_cache(args.features, spec.stride, int(10e9))
     model = build_model(
-        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, args.device
+        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, args.device, timing=timing
     )
     baseline_state = model.adapter_state()
     adapted_state = torch.load(args.adapters, map_location="cpu", weights_only=False)["adapters"]

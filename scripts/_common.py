@@ -12,6 +12,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from robojepa_ttt.data.dataset_meta import DatasetTiming, common_timing, timing_for  # noqa: E402
 from robojepa_ttt.data.feature_store import DiskFeatures  # noqa: E402
 from robojepa_ttt.data.offline_dataset import load_episode  # noqa: E402
 from robojepa_ttt.learning.replay import FeatureCache  # noqa: E402
@@ -39,6 +40,8 @@ def load_servo(path) -> ServoParams:
 def load_episodes(directory):
     episodes, view_ids = [], {}
     for path in sorted(Path(directory).glob("*.npz")):
+        if path.name.endswith(".tmp.npz"):  # an interrupted write, never a complete episode
+            continue
         episode, views = load_episode(path)
         episodes.append(episode)
         view_ids[episode.episode_id] = views
@@ -52,15 +55,30 @@ def feature_cache(directory, stride: int, byte_budget: int) -> FeatureCache:
     return FeatureCache(lambda episode, tick: disk.get(episode, tick), byte_budget)
 
 
-def build_model(config_path, weights_path, units, servo, settings, device, checkpointing=False) -> AdaptedPredictor:
+def yaml_timing(settings) -> DatasetTiming:
+    timing = settings.raw["timing"]
+    return timing_for(timing["io_target_hz"], timing["nominal_macro_dt_s"], timing["command_history_s"])
+
+
+def dataset_timing(settings, *directories) -> DatasetTiming:
+    """Timing from the datasets' dataset.json, falling back to the YAML for older data.
+
+    Refuses datasets with different rates: a model trained at one rate cannot be
+    validated or tested at another.
+    """
+    timing = common_timing(*directories, default=yaml_timing(settings))
+    print(f"timing: {timing.fps:g} fps, {timing.stride} ticks per macro step, {timing.history_ticks} history ticks")
+    return timing
+
+
+def build_model(config_path, weights_path, units, servo, settings, device, checkpointing=False, timing=None) -> AdaptedPredictor:
     """Load weights first: wrapping attention renames the keys they load into."""
     config = load_json_config(config_path)
     config["use_activation_checkpointing"] = checkpointing
     predictor = build_predictor(config)
     load_predictor_weights(predictor, weights_path)
     lora = settings.raw["predictor"]["lora"]
-    timing = settings.raw["timing"]
-    tick_s = 1.0 / timing["io_target_hz"]
+    timing = timing or yaml_timing(settings)
     model = AdaptedPredictor(
         predictor,
         units,
@@ -69,12 +87,12 @@ def build_model(config_path, weights_path, units, servo, settings, device, check
         last_blocks=lora["last_blocks"],
         lora_rank=lora["rank"],
         lora_alpha=lora["alpha"],
-        stride=timing["nominal_raw_steps_per_macro"],
-        tick_s=tick_s,
-        history_ticks=round(timing["command_history_s"] * timing["io_target_hz"]),
+        stride=timing.stride,
+        tick_s=timing.tick_s,
+        history_ticks=timing.history_ticks,
         amp_dtype=torch.bfloat16 if torch.device(device).type == "cuda" else None,
     )
     return model.to(device)
 
 
-__all__ = ["ROOT", "build_model", "feature_cache", "load_episodes", "load_servo", "load_units", "np"]
+__all__ = ["ROOT", "build_model", "dataset_timing", "feature_cache", "load_episodes", "load_servo", "load_units", "np", "yaml_timing"]

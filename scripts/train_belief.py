@@ -38,7 +38,7 @@ torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.set_float32_matmul_precision("highest")
 
-from _common import feature_cache, load_episodes, load_servo, load_units
+from _common import dataset_timing, feature_cache, load_episodes, load_servo, load_units
 from robojepa_ttt.belief.calibration import fit_calibration, innovation_summary
 from robojepa_ttt.belief.compact import CompactBelief
 from robojepa_ttt.belief.data import BeliefSequences, SequenceSpec, joint_loss_scale, residual_bound_from_data
@@ -87,13 +87,12 @@ def main():
 
     settings = load_settings(args.settings) if args.settings else load_settings()
     raw = settings.raw
-    timing, compact_raw = raw["timing"], raw["offline"]["compact"]
+    compact_raw = raw["offline"]["compact"]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     units, servo = load_units(args.units), load_servo(args.servo)
-    stride = timing["nominal_raw_steps_per_macro"]
-    tick_s = 1.0 / timing["io_target_hz"]
-    history = round(timing["command_history_s"] * timing["io_target_hz"])
+    timing = dataset_timing(settings, *[d for d in (args.train, args.validation, args.calibration) if d])
+    stride, tick_s, history = timing.stride, timing.tick_s, timing.history_ticks
 
     train_eps, train_views = load_episodes(args.train)
     val_eps, val_views = load_episodes(args.validation)

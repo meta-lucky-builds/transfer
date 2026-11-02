@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from _common import load_episodes
+from robojepa_ttt.data.dataset_meta import load_meta
 from robojepa_ttt.models.servo import fit_servo
 
 
@@ -20,10 +21,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--tick", type=float, default=1 / 30)
+    parser.add_argument("--tick", type=float, default=None, help="default: 1 / fps from dataset.json")
     parser.add_argument("--max-delay", type=float, default=0.3)
     args = parser.parse_args()
 
+    if args.tick is None:
+        meta = load_meta(args.episodes)
+        if meta is None:
+            raise ValueError("no dataset.json next to the episodes: pass --tick explicitly")
+        args.tick = meta.timing.tick_s
+    print(f"tick {args.tick:.5f} s")
     episodes, _ = load_episodes(args.episodes)
     positions, commands = [], []
     for episode in episodes:

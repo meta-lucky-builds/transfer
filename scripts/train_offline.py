@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from _common import build_model, feature_cache, load_episodes, load_servo, load_units
+from _common import build_model, dataset_timing, feature_cache, load_episodes, load_servo, load_units
 from robojepa_ttt.config import load_settings
 from robojepa_ttt.data.offline_dataset import KeyframeSampler
 from robojepa_ttt.evaluation.prediction import rollout_errors
@@ -57,11 +57,12 @@ def main():
     config = settings.offline
     if args.microbatch:
         config = replace(config, microbatch=args.microbatch)
-    timing = settings.raw["timing"]
+    timing = dataset_timing(settings, args.train, args.validation)
     spec = WindowSpec(
         frames=config.sequence_frames,
-        stride=timing["nominal_raw_steps_per_macro"],
-        tick_s=1.0 / timing["io_target_hz"],
+        stride=timing.stride,
+        tick_s=timing.tick_s,
+        history_ticks=timing.history_ticks,
     )
     budget = int(args.feature_cache_gb * 1e9)
     train_episodes, train_views = load_episodes(args.train)
@@ -97,7 +98,8 @@ def main():
         )
 
     model = build_model(
-        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=True
+        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=True,
+        timing=timing,
     )
     trainer = OfflineTrainer(model, config, args.out, dist)
     if trainer.resume() and dist.is_main:
