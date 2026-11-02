@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-02",
+  "robojepa_commit": "f93106f5f4a451fd526d51778aa8ab7c852eb824",
+  "papers": [
+    {
+      "name": "RoboJEPA",
+      "url": "https://arxiv.org/html/2610.10515v1"
+    },
+    {
+      "name": "JEPA-TTT",
+      "url": "https://arxiv.org/html/2610.00722v1"
+    }
+  ],
+  "code": [
+    {
+      "title": "predictor.py",
+      "url": "https://github.com/facebookresearch/robo_jepa/blob/f93106f5f4a451fd526d51778aa8ab7c852eb824/app/robo_jepa/robo_jepa/models/predictor.py",
+      "blob_sha": "5755bbf4762535545224b814b1abcc85125c8c8a"
+    },
+    {
+      "title": "mpc_utils.py",
+      "url": "https://github.com/facebookresearch/robo_jepa/blob/f93106f5f4a451fd526d51778aa8ab7c852eb824/app/robo_jepa/mpc/mpc_utils.py",
+      "blob_sha": "b7b999bdcf2ad6de3577e03a288fa631ccde6c5c"
+    },
+    {
+      "title": "so_follower.py",
+      "url": "https://github.com/huggingface/lerobot/blob/main/src/lerobot/robots/so_follower/so_follower.py",
+      "blob_sha": "be78bc9623b72155bb87660763d7e2c2ed481d5f"
+    },
+    {
+      "title": "world_model.py",
+      "url": "https://github.com/facebookresearch/robo_jepa/blob/f93106f5f4a451fd526d51778aa8ab7c852eb824/app/robo_jepa/world_model.py",
+      "blob_sha": "fd20b8d75df9edc296bbefb292ee5490e95df0f0"
+    },
+    {
+      "title": "train.py",
+      "url": "https://github.com/facebookresearch/robo_jepa/blob/f93106f5f4a451fd526d51778aa8ab7c852eb824/app/robo_jepa/train.py",
+      "blob_sha": "37873f7d1035d5040f1bdcad473758b36f301b8e"
+    }
+  ]
+}

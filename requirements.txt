@@ -1,0 +1,11 @@
+# Install torch for your CUDA version from pytorch.org first.
+# The RoboJEPA code itself comes from third_party/robo_jepa at commit f93106f5.
+numpy
+scipy
+einops
+timm
+pyyaml
+wandb
+pytest
+# Needed only by scripts/prepare_lerobot.py and the recorder:
+# lerobot

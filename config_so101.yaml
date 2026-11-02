@@ -1,0 +1,307 @@
+# Proposed starting configuration, NOT a trained/validated deployment.
+# SPECIFICATION.md defines semantics. Null hardware values must be measured.
+schema_version: 1
+status: proposed_unvalidated
+seed: 101
+robot:
+  type: so101_follower
+  joint_order: [shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper]
+  body_units_internal: radians
+  gripper_units_internal: calibrated_0_closed_1_open
+  device_use_degrees: true
+  calibration_hash: null
+  device_software_commit: null
+  joint_limits_rad: null
+  joint_velocity_limits_rad_s: null
+  joint_acceleration_limits_rad_s2: null
+  maximum_joint_increment_rad: null
+  gripper_increment_limit: null
+  gripper_direction_verified: false
+  camera_calibration_hash: null
+  servo_time_constants_s: null
+  servo_delay_s: null
+  joint_sensor_std_normalized: null
+  compact_normalization_center: null
+  compact_normalization_scale: null
+  residual_joint_bound_normalized: null
+  stop_policy_commissioned: false
+  movement_enabled: false
+timing:
+  io_target_hz: 30
+  camera_target_hz: 30
+  macro_hz: 5
+  nominal_macro_dt_s: 0.2
+  nominal_raw_steps_per_macro: 6
+  command_history_s: 1.0
+  profile: stop_observe_plan_execute
+  continuous_p99_latency_gate_ms: 300
+  continuous_max_visual_age_ms: 500
+  command_expiry_after_validation_ms: 300
+  fixed_lag_s: 2.0
+  clock_uncertainty_bound_ms: null
+  max_prediction_only_gap_s: 0.5
+representation:
+  encoder: frozen_vjepa_2_1_vitG
+  encoder_checkpoint_hash: null
+  preprocessing_hash: null
+  image_height: 240
+  image_width: 320
+  max_views: 2
+  view_semantics: [external, external] # two fixed phones, no wrist camera
+  checkpoint_view_ids: null
+  token_rows: 15
+  token_cols: 20
+  token_channels: 1664
+  metric_layernorm_eps: 0.00001
+  online_encoder_updates: false
+  sketch:
+    pooled_rows: 3
+    pooled_cols: 4
+    pca_dims_per_view: 64
+    total_visual_dims: 128
+    fit_split: train_only
+    statistics_frozen_online: true
+predictor:
+  repo_commit: f93106f5f4a451fd526d51778aa8ab7c852eb824
+  profile: wm_2b # released cooldown_2b_450k.pth.tar
+  checkpoint_hash: null
+  embodiment_name: so-101_joints
+  resolve_embodiment_by_name: true
+  padded_action_dim: 64
+  padded_state_dim: 64
+  require_joint_integration_patch: true
+  require_joint_cem_sampler: true
+  require_legacy_units_fixture: true
+  max_context_frames: 8
+  dtype: bfloat16
+  base_weights_frozen: true
+  encoder_frozen: true
+  lora:
+    last_blocks: 8
+    targets: [query, value, attention_output]
+    rank: 8
+    alpha: 16
+    dropout: 0.0
+    b_zero_init: true
+    regime_specific: true
+  token_residual:
+    bottleneck: 32
+    modulation_hidden: [256, 256]
+    view_embedding_dim: 8
+    position_dims: 2
+    output_zero_init: true
+belief:
+  latent_state_dim: 64
+  joint_dims: 6
+  fast_dims: 48
+  slow_dims: 10
+  recurrent_hidden: 256
+  recurrent_input_dim: 203
+  command_hidden: 64
+  command_input_dim: 8
+  regime_embedding_dim: 16
+  observation_dim_two_views: 134
+  active_regimes: 1
+  max_regimes: 4
+  filter: imm_ekf
+  covariance_dtype: float32
+  mean_transition_hidden: [256, 256, 256]
+  observation_hidden: [256, 256]
+  fast_initial_decay_seconds: 10.0
+  fast_residual_coefficient_per_macro: 0.1
+  slow_deterministic_transition: identity
+  observation_matrix_initial_bound: 0.1
+  mode_residence_prior_seconds: 600.0
+  process_variance_per_macro:
+    joint: 0.0001
+    fast: 0.001
+    slow: 0.00001
+  process_variance_bounds:
+    joint_fast: [0.000001, 0.1]
+    slow: [0.00000001, 0.01]
+  visual_initial_observation_std: 0.2
+  initial_fast_variance: 1.0
+  initial_slow_variance: 1.0
+  initialization_frames: 20
+  online_covariance_updates: false
+  online_observation_updates: false
+  online_gru_updates: false
+  online_transition_correction:
+    rank: 8
+    input_dim: 256
+    output_dim: 54
+    before_residual_tanh: true
+    b_zero_init: true
+  numerical_jitter_initial: 0.0000001
+  numerical_jitter_max: 0.001
+  update_imagined_observations: false
+change_detection:
+  statistic: calibrated_preupdate_innovation
+  cusum_kappa: 0.5
+  cusum_threshold: 10.0
+  minimum_valid_macro_observations: 5
+  switch_posterior_threshold: 0.8
+  switch_hold_observations: 5
+  planning_mode_probability_cutoff: 0.05
+  new_mode_minimum_transitions: 256
+  automatic_mode_eviction: false
+data:
+  split_unit: session_then_episode
+  train_fraction: 0.7
+  validation_fraction: 0.1
+  calibration_fraction: 0.1
+  final_test_fraction: 0.1
+  require_issued_commands: true
+  require_capture_and_receipt_times: true
+  prohibit_cross_reset_windows: true
+  prohibit_future_state_inputs: true
+  horizontal_flip: false
+  photometric_augmentation: false
+offline:
+  compact:
+    sequence_steps: 32
+    burn_in_steps: 16
+    effective_batch: 32
+    max_updates: 40000
+    warmup_updates: 1000
+    lr: 0.0003
+    final_lr: 0.00003
+    schedule: cosine
+    optimizer: adamw
+    betas: [0.9, 0.99]
+    eps: 0.00000001
+    weight_decay: 0.0001
+    grad_clip_norm: 1.0
+    validation_interval_updates: 500
+    early_stop_patience_evaluations: 8
+    differentiate_covariance_and_jacobians: true
+    loss_weights:
+      predictive_nll: 1.0
+      joint_huber: 0.5
+      regularity: 0.0001
+      supervised_regime_ce_when_available: 0.1
+  visual:
+    sequence_frames: 16
+    effective_batch: 16
+    microbatch_initial: 1
+    antithetic_samples: 2
+    max_updates: 20000
+    warmup_updates: 500
+    rollout_curriculum: [{updates: 5000, horizon: 2}, {updates: 10000, horizon: 5}, {updates: 5000, horizon: 10}]
+    rollout_discount: 0.95
+    detach_recurrent_visual_predictions: true
+    stop_visual_gradient_into_servo: true
+    optimizer: adamw
+    betas: [0.9, 0.95]
+    eps: 0.00000001
+    lora_lr: 0.0001
+    residual_lr: 0.0003
+    optional_embodiment_projection_lr: 0.00001
+    embodiment_projection_trainable: false
+    weight_decay: 0.01
+    grad_clip_norm: 1.0
+    schedule: cosine
+    final_lr_fraction: 0.1
+    activation_checkpointing: true
+    loss_weights:
+      realized_motion: 0.25
+      command_tf: 0.5
+      autonomous_rollout: 0.5
+      compact_full_consistency: 0.05
+  alternating_refinement:
+    enabled_after_stage_gates: true
+    max_updates: 5000
+    lr_fraction_of_peak: 0.1
+online:
+  enabled_after_gates: false
+  optimizer: adamw
+  betas: [0.9, 0.99]
+  eps: 0.00000001
+  lora_lr: 0.00001
+  residual_lr: 0.00003
+  compact_correction_lr: 0.00001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  warmup_updates: 100
+  effective_batch: 16
+  initial_rollout_horizon: 2
+  maximum_rollout_horizon: 5
+  new_unique_windows_per_update_credit: 16
+  minimum_valid_windows: 256
+  maximum_updates_per_second: 1.0
+  maximum_credit_backlog: 100
+  maximum_operational_duty_fraction: 0.1
+  persist_optimizer_across_episodes: true
+  optimizer_per_regime: true
+  normalization_stats_frozen: true
+  visual_loss_weights:
+    command_tf: 1.0
+    autonomous_rollout: 0.5
+    compatible_functional_anchor: 0.1
+    proximal: 0.0001
+  compact_loss_weights:
+    predictive_nll: 1.0
+    joint_huber: 0.5
+    compatible_joint_anchor: 0.1
+replay:
+  dense_start_stride_raw: 1
+  nominal_keyframe_stride_raw: 6
+  store_window_indices_only: true
+  feature_cache_byte_budget: 20000000000
+  total_replay_byte_budget: 200000000000
+  recent_windows: 10000
+  per_regime_reservoir_windows: 20000
+  immutable_anchor_windows_total: 5000
+  quarantine_windows: 5000
+  recent_fraction: 0.5
+  same_regime_fraction: 0.25
+  compatible_anchor_fraction: 0.25
+  prioritized: false
+  online_reconstruction_macro_steps: 32
+promotion:
+  minimum_snapshot_interval_s: 30
+  challengers_in_flight: 1
+  future_validation_macro_transitions: 128
+  temporal_block_seconds: 2.0
+  anchor_windows: 512
+  minimum_relative_visual_improvement: 0.02
+  bootstrap_confidence: 0.9
+  bootstrap_replicates: 2000
+  maximum_joint_regression_fraction: 0.02
+  maximum_anchor_group_regression_fraction: 0.05
+  maximum_task_probe_regression_fraction: 0.05
+  rollback_prequential_regression_fraction: 0.1
+  rollback_window_seconds: 60
+  retain_validated_versions: 3
+  immutable_model_per_plan: true
+  reconstruct_belief_on_promotion: true
+  rebuild_kv_cache_on_promotion: true
+planning:
+  objective: terminal_goal_image
+  view_goal_weights: [0.5, 0.5] # both views are fixed, so neither dominates for the wrong reason
+  foreground_weight_optional: 4.0
+  background_weight: 1.0
+  horizon_macro_steps: 5
+  execute_macro_steps: 1
+  candidates: 128
+  iterations: 4
+  elites: 16
+  initial_std_normalized: 0.35
+  std_floor_normalized: 0.05
+  mean_old_momentum: 0.2
+  std_old_momentum: 0.5
+  include_hold: true
+  include_previous_feasible_plan: true
+  validate_final_mean: true
+  particles_after_deterministic_debug: 4
+  common_random_numbers: true
+  movement_cost_weight: 0.01
+  smoothness_cost_weight: 0.05
+  cvar_alpha: 0.8
+  cvar_mixture_weight: 0.25
+  epistemic_heads: 1
+  epistemic_weight: 0.0 # use 0.1 only after independently trained 3-head extension
+  online_exploration_bonus: 0.0
+  microbatch_initial: 1
+  require_fresh_revalidation: true
+
