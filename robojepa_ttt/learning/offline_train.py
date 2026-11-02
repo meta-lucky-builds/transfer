@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Optional
 import torch
 
 from ..models.adapted_predictor import AdaptedPredictor
+from .distributed import SINGLE, DistContext, all_reduce_gradients, all_reduce_sum, broadcast_object, broadcast_parameters
 from .losses import discounted_rollout_loss, token_metric
 from .online_builder import build_optimizer
 
@@ -90,13 +91,38 @@ def visual_loss(
 
 
 class OfflineTrainer:
-    def __init__(self, model: AdaptedPredictor, config: OfflineConfig, directory: str | os.PathLike):
+    """Stage-3 trainer. With a multi-rank DistContext it is data parallel.
+
+    The effective batch of sequences is split evenly over ranks, so the objective and
+    the optimizer step are the same as one process accumulating every microbatch.
+    Only rank 0 validates, saves and logs; its decisions are broadcast so every rank
+    stops at the same update.
+    """
+
+    def __init__(
+        self,
+        model: AdaptedPredictor,
+        config: OfflineConfig,
+        directory: str | os.PathLike,
+        dist: DistContext = SINGLE,
+    ):
+        micro_steps = config.effective_batch // config.microbatch
+        if config.effective_batch % config.microbatch or micro_steps % dist.world_size:
+            raise ValueError(
+                f"effective batch {config.effective_batch} must split into microbatches of {config.microbatch} "
+                f"shared evenly by {dist.world_size} ranks"
+            )
         self.model = model
         self.config = config
+        self.dist = dist
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.rng = random.Random(config.seed)
+        if dist.is_main:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        # Ranks draw different random contexts; data shards are the caller's job.
+        self.rng = random.Random(config.seed + dist.rank)
         groups = model.set_trainable("offline")
+        # Rank 0's random LoRA A and residual initialisation become everyone's.
+        broadcast_parameters(model.trainable_named().values(), dist)
         self.optimizer = build_optimizer(
             groups,
             {"lora": config.lora_lr, "residual": config.residual_lr},
@@ -116,6 +142,8 @@ class OfflineTrainer:
         return self.rng.randint(1, limit)
 
     def _save(self, name: str) -> None:
+        if not self.dist.is_main:
+            return
         path = self.directory / name
         temporary = path.with_suffix(".tmp")
         torch.save(
@@ -140,7 +168,11 @@ class OfflineTrainer:
         self.model.set_trainable("offline")
         self.optimizer.load_state_dict(state["optimizer"])
         self.update, self.best, self.stale = state["update"], state["best"], state["stale"]
-        self.rng.setstate(state["rng"])
+        if self.dist.is_main:
+            self.rng.setstate(state["rng"])
+        else:
+            # Only rank 0's stream is saved; keep the others distinct and reproducible.
+            self.rng = random.Random(self.config.seed + self.dist.rank + 7919 * self.update)
         return True
 
     def train_step(self, next_batch: Callable[[], dict]) -> dict:
@@ -149,19 +181,22 @@ class OfflineTrainer:
         for group in self.optimizer.param_groups:
             group["lr"] = group["base_lr"] * factor
         horizon = horizon_at(self.update, cfg)
-        micro_steps = cfg.effective_batch // cfg.microbatch
+        micro_steps = cfg.effective_batch // cfg.microbatch  # over all ranks
+        local_steps = micro_steps // self.dist.world_size
         self.optimizer.zero_grad(set_to_none=True)
-        totals: dict[str, float] = {}
-        total_loss = 0.0
-        for _ in range(micro_steps):
+        totals: dict[str, float] = {"loss": 0.0}
+        for _ in range(local_steps):
             batch = next_batch()
             context = self._context(batch["features"].shape[1], horizon)
             loss, parts = visual_loss(self.model, batch, context, horizon, cfg)
             (loss / micro_steps).backward()
-            total_loss += loss.item() / micro_steps
+            totals["loss"] += loss.item() / micro_steps
             for key, value in parts.items():
                 totals[key] = totals.get(key, 0.0) + value / micro_steps
         parameters = list(self.model.trainable_named().values())
+        all_reduce_gradients(parameters, self.dist)
+        totals = all_reduce_sum(totals, self.dist, parameters[0].device)
+        total_loss = totals.pop("loss")
         grad_norm = torch.nn.utils.clip_grad_norm_(parameters, cfg.grad_clip_norm)
         if not math.isfinite(total_loss) or not torch.isfinite(grad_norm):
             raise FloatingPointError(f"non-finite training step at update {self.update}: loss {total_loss}")
@@ -179,12 +214,16 @@ class OfflineTrainer:
 
         Stops after patience_evaluations without improvement and does not run the
         remaining curriculum just to match a schedule (spec 10.6).
+
+        Only rank 0 calls validate; the score is broadcast so all ranks agree on the
+        best checkpoint and on when to stop.
         """
         started = time.time()
         while self.update < self.config.max_updates:
             record = self.train_step(next_batch)
             if self.update % self.config.validation_interval == 0:
-                record["validation"] = validate(self.model)
+                score = validate(self.model) if self.dist.is_main else None
+                record["validation"] = broadcast_object(score, self.dist)
                 if record["validation"] < self.best:
                     self.best = record["validation"]
                     self.stale = 0
@@ -193,7 +232,7 @@ class OfflineTrainer:
                     self.stale += 1
                 self._save("latest.pt")
             self.log.append(record)
-            if log is not None:
+            if log is not None and self.dist.is_main:
                 log(record)
             if self.stale >= self.config.patience_evaluations:
                 break

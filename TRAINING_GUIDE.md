@@ -69,6 +69,12 @@ This code implements baseline B1 of [SPECIFICATION.md](SPECIFICATION.md): RoboJE
    python scripts/train_offline.py --predictor-config sources/wm_300m_config.json --weights W --units U --servo S --train data/train/episodes --validation data/val/episodes --features data/all/features --out runs/stage3
    ```
 
+   Multi-GPU is data parallel: launch the same arguments with `torchrun`. Each GPU holds the full predictor, and the GPU count must divide `effective_batch / microbatch` (16 by default, so 1, 2, 4, 8 or 16 GPUs). Only adapter gradients are exchanged. Rank 0 validates and saves.
+
+   ```bash
+   torchrun --nproc_per_node 8 scripts/train_offline.py --predictor-config sources/wm_2b_config.json --weights W --units U --servo S --train data/train/episodes --validation data/val/episodes --features data/all/features --out runs/stage3
+   ```
+
 8. **Evaluate B0 against adapted weights.**
 
    ```bash

@@ -6,6 +6,13 @@
         --features data/X/features --out runs/stage3
 
 Resumes from runs/stage3/latest.pt when it exists.
+
+Multi-GPU, data parallel: launch the same command with torchrun. The GPU count must
+divide effective_batch / microbatch (16 sequences by default, so 1, 2, 4, 8 or 16).
+
+    torchrun --nproc_per_node 8 scripts/train_offline.py ...same arguments...
+
+Several machines: add --nnodes, --node_rank and --rdzv_endpoint as torchrun documents.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ from _common import build_model, feature_cache, load_episodes, load_servo, load_
 from robojepa_ttt.config import load_settings
 from robojepa_ttt.data.offline_dataset import KeyframeSampler
 from robojepa_ttt.evaluation.prediction import rollout_errors
+from robojepa_ttt.learning.distributed import cleanup, init_distributed
 from robojepa_ttt.learning.offline_train import OfflineTrainer
 from robojepa_ttt.learning.windows import WindowSpec
 
@@ -43,6 +51,8 @@ def main():
     parser.add_argument("--feature-cache-gb", type=float, default=20.0)
     args = parser.parse_args()
 
+    dist = init_distributed()
+    device = f"cuda:{dist.local_rank}" if dist.enabled and torch.cuda.is_available() else args.device
     settings = load_settings(args.settings) if args.settings else load_settings()
     config = settings.offline
     if args.microbatch:
@@ -66,26 +76,31 @@ def main():
         spec,
         feature_cache(args.features, spec.stride, budget),
         config.microbatch,
-        args.device,
-        config.seed,
+        device,
+        config.seed + 1000 * dist.rank,  # each rank draws its own windows
     )
-    validation = KeyframeSampler(
-        validation_episodes,
-        validation_views,
-        spec,
-        feature_cache(args.validation_features or args.features, spec.stride, budget // 4),
-        config.microbatch,
-        args.device,
-        config.seed,
-    )
-    fixed_validation = list(validation.ordered_batches(256))
-    print(f"windows: train {train.total}, validation {validation.total}, fixed validation batches {len(fixed_validation)}")
+    fixed_validation = []
+    if dist.is_main:  # only rank 0 validates
+        validation = KeyframeSampler(
+            validation_episodes,
+            validation_views,
+            spec,
+            feature_cache(args.validation_features or args.features, spec.stride, budget // 4),
+            config.microbatch,
+            device,
+            config.seed,
+        )
+        fixed_validation = list(validation.ordered_batches(256))
+        print(
+            f"ranks {dist.world_size}, windows: train {train.total}, validation {validation.total}, "
+            f"fixed validation batches {len(fixed_validation)}"
+        )
 
     model = build_model(
-        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, args.device, checkpointing=True
+        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=True
     )
-    trainer = OfflineTrainer(model, config, args.out)
-    if trainer.resume():
+    trainer = OfflineTrainer(model, config, args.out, dist)
+    if trainer.resume() and dist.is_main:
         print(f"resumed at update {trainer.update}")
 
     def validate(current) -> float:
@@ -96,8 +111,11 @@ def main():
         if record["update"] % 20 == 0 or "validation" in record:
             print(json.dumps(record), flush=True)
 
-    print(trainer.fit(train.next_batch, validate, log))
-    Path(args.out, "log.json").write_text(json.dumps(trainer.log), encoding="utf-8")
+    result = trainer.fit(train.next_batch, validate, log)
+    if dist.is_main:
+        print(result)
+        Path(args.out, "log.json").write_text(json.dumps(trainer.log), encoding="utf-8")
+    cleanup(dist)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,8 @@ def test_wide_camera_is_centre_cropped_not_stretched():
     frames = torch.zeros(1, 90, 160, 3, dtype=torch.uint8)
     frames[:, :, :20] = 255  # a band that a 4:3 centre crop removes
     frames[:, :, 140:] = 255
-    assert preprocess(frames)[0].std() < 1e-6
+    # Per channel: ImageNet normalisation maps black to a different value per channel.
+    assert preprocess(frames)[0].flatten(1).std(dim=1).max() < 1e-6
 
 
 def test_large_phone_frames_are_antialiased():
