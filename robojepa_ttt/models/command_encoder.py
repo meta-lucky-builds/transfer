@@ -36,7 +36,8 @@ class CommandEncoder(nn.Module):
         """features: [..., L, 8]. Returns [..., hidden]."""
         leading = features.shape[:-2]
         flat = features.reshape(-1, features.shape[-2], COMMAND_FEATURES)
-        # Recurrent kernels have no bf16 path; keep this small model in fp32.
+        # Recurrent kernels have no bf16 path; run in the weights' own dtype (fp32 in the
+        # predictor, fp64 in belief tests) with autocast off.
         with torch.autocast(device_type=features.device.type, enabled=False):
-            _, last = self.gru(flat.float())
+            _, last = self.gru(flat.to(self.gru.weight_ih_l0.dtype))
         return last[0].reshape(*leading, self.hidden)
