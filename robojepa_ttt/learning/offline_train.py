@@ -105,6 +105,7 @@ class OfflineTrainer:
         config: OfflineConfig,
         directory: str | os.PathLike,
         dist: DistContext = SINGLE,
+        loss_fn: Optional[Callable] = None,
     ):
         micro_steps = config.effective_batch // config.microbatch
         if config.effective_batch % config.microbatch or micro_steps % dist.world_size:
@@ -115,6 +116,8 @@ class OfflineTrainer:
         self.model = model
         self.config = config
         self.dist = dist
+        # Same signature as visual_loss; belief.visual.belief_visual_loss plugs in for B4.
+        self.loss_fn = loss_fn or visual_loss
         self.directory = Path(directory)
         if dist.is_main:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -188,7 +191,7 @@ class OfflineTrainer:
         for _ in range(local_steps):
             batch = next_batch()
             context = self._context(batch["features"].shape[1], horizon)
-            loss, parts = visual_loss(self.model, batch, context, horizon, cfg)
+            loss, parts = self.loss_fn(self.model, batch, context, horizon, cfg)
             (loss / micro_steps).backward()
             totals["loss"] += loss.item() / micro_steps
             for key, value in parts.items():

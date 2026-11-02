@@ -248,19 +248,32 @@ class AdaptedPredictor(nn.Module):
         )
         return ticks[:, self.stride - 1 :: self.stride]
 
-    def sequence_inputs(self, batch: dict, context: int, horizon: int):
+    def sequence_inputs(self, batch: dict, context: int, horizon: int, motion: Optional[torch.Tensor] = None):
         """Legacy actions and states for positions 0..context+horizon-2.
 
-        Implements the causality contract in the module docstring.
+        Implements the causality contract in the module docstring. motion [B, H, 6],
+        physical joints of keyframes context..context+horizon-1, replaces the servo
+        prediction: the belief's predicted joints in B4. It must itself be causal
+        (built from data up to frame context-1 and issued commands only).
         """
         measured = batch["position"][:, :context]
-        predicted = self.predicted_positions(batch, context, horizon)
+        predicted = self.predicted_positions(batch, context, horizon) if motion is None else motion
+        if predicted.shape[1] != horizon:
+            raise ValueError(f"motion covers {predicted.shape[1]} keyframes, horizon is {horizon}")
         trajectory = torch.cat([measured, predicted], dim=1)
         legacy = self.units.physical_to_legacy(trajectory)
         actions = legacy[:, 1:] - legacy[:, :-1]
         return actions, legacy[:, :-1]
 
-    def rollout(self, batch: dict, context: int, horizon: int, use_kv_generation: bool = True) -> torch.Tensor:
+    def rollout(
+        self,
+        batch: dict,
+        context: int,
+        horizon: int,
+        use_kv_generation: bool = True,
+        motion: Optional[torch.Tensor] = None,
+        belief: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Autonomous command rollout. Returns [B, H, V, H, W, C], predictions of frames
         context..context+horizon-1, with gradient through the current parameters.
 
@@ -269,11 +282,17 @@ class AdaptedPredictor(nn.Module):
         fed-back frames are detached and attention is frame-causal. This matches
         upstream _rollout_fused and spec 9.2, where later losses do not backpropagate
         through earlier visual predictions.
+
+        motion [B, H, 6] and belief [B, context + horizon - 1, belief_dim] are the B4
+        inputs: belief-predicted joints and the residual's [h_t, x_{t+1}] per position.
+        Both must arrive detached, so visual losses cannot train the belief (spec 9.4).
         """
         length = context + horizon - 1
+        if belief is not None and belief.shape[1] != length:
+            raise ValueError(f"belief covers {belief.shape[1]} positions, the sequence has {length}")
         if length > self.predictor.num_frames:
             raise ValueError(f"sequence of {length} frames exceeds the model's {self.predictor.num_frames}")
-        actions, states = self.sequence_inputs(batch, context, horizon)
+        actions, states = self.sequence_inputs(batch, context, horizon, motion)
         command = self.encode_commands(batch, length)
         observed = batch["features"][:, :context]
         view_ids = batch["view_ids"]
@@ -282,7 +301,7 @@ class AdaptedPredictor(nn.Module):
         if horizon > 1:
             with torch.no_grad(), self.amp():
                 generated = self._generate(
-                    observed, actions, states, view_ids, command, context, horizon, use_kv_generation
+                    observed, actions, states, view_ids, command, context, horizon, use_kv_generation, belief
                 )
 
         # Autocast caches detached casts of leaf parameters during no_grad passes.
@@ -290,11 +309,15 @@ class AdaptedPredictor(nn.Module):
         torch.clear_autocast_cache()
         with self.amp():
             sequence = torch.cat([observed, *generated], dim=1) if generated else observed
-            output = self.forward_tokens(sequence.detach(), actions, states, view_ids, command)
+            output = self.forward_tokens(sequence.detach(), actions, states, view_ids, command, belief)
         return output[:, context - 1 :]
 
-    def _generate(self, observed, actions, states, view_ids, command, context, horizon, use_kv):
+    def _generate(self, observed, actions, states, view_ids, command, context, horizon, use_kv, belief=None):
         frames: list[torch.Tensor] = []
+
+        def cond(start, end):
+            return None if belief is None else belief[:, start:end]
+
         if use_kv:
             z0, _, _, cache = self._call_predictor(
                 observed,
@@ -306,7 +329,7 @@ class AdaptedPredictor(nn.Module):
                 cache_size=0,
                 input_position=0,
             )
-            pred = self.residual(z0[:, -1:], command[:, context - 1 : context], view_ids, self.regime)
+            pred = self.residual(z0[:, -1:], command[:, context - 1 : context], view_ids, self.regime, cond(context - 1, context))
             frames.append(pred)
             for k in range(1, horizon - 1):
                 t = context - 1 + k
@@ -320,18 +343,18 @@ class AdaptedPredictor(nn.Module):
                     cache_size=cache.pointer[0],
                     input_position=t,
                 )
-                pred = self.residual(z0, command[:, t : t + 1], view_ids, self.regime)
+                pred = self.residual(z0, command[:, t : t + 1], view_ids, self.regime, cond(t, t + 1))
                 frames.append(pred)
             return frames
         sequence = observed
         for k in range(horizon - 1):
             T = context + k
-            out = self.forward_tokens(sequence, actions[:, :T], states[:, :T], view_ids, command[:, :T])
+            out = self.forward_tokens(sequence, actions[:, :T], states[:, :T], view_ids, command[:, :T], cond(0, T))
             frames.append(out[:, -1:])
             sequence = torch.cat([sequence, frames[-1]], dim=1)
         return frames
 
-    def realized_forward(self, batch: dict, frames: int) -> torch.Tensor:
+    def realized_forward(self, batch: dict, frames: int, belief: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Eq. 23: teacher forcing on realized motion. Diagnostic and pretraining only.
 
         Deployable prediction cannot use this path, as it reads the realized motion.
@@ -341,7 +364,7 @@ class AdaptedPredictor(nn.Module):
         command = self.encode_commands(batch, frames - 1)
         with self.amp():
             return self.forward_tokens(
-                batch["features"][:, : frames - 1], actions, legacy[:, :-1], batch["view_ids"], command
+                batch["features"][:, : frames - 1], actions, legacy[:, :-1], batch["view_ids"], command, belief
             )
 
     # ---------------------------------------------------------------- caching
@@ -362,7 +385,9 @@ class AdaptedPredictor(nn.Module):
         return ContextCache(cache, self.version)
 
     @torch.no_grad()
-    def step_cached(self, frame, action, state, view_ids, command, context: Optional[ContextCache], position: int):
+    def step_cached(
+        self, frame, action, state, view_ids, command, context: Optional[ContextCache], position: int, belief=None
+    ):
         """One prediction from a single new frame. Returns (prediction, updated cache)."""
         if context is not None and context.version != self.version:
             raise StaleCacheError(f"cache built by {context.version}, model is {self.version}")
@@ -378,7 +403,7 @@ class AdaptedPredictor(nn.Module):
                 cache_size=cache.pointer[0] if cache is not None else 0,
                 input_position=position,
             )
-            prediction = self.residual(z0, command, view_ids, self.regime)
+            prediction = self.residual(z0, command, view_ids, self.regime, belief)
         return prediction, ContextCache(cache, self.version)
 
 

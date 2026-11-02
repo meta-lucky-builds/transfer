@@ -236,6 +236,7 @@ class StepOutput:
     log_posterior: torch.Tensor  # [B, K]
     motion_allowed: torch.Tensor  # [B], False when joint feedback is missing
     predicted_observation: torch.Tensor  # [B, m] mixture prior mean
+    prior_state_mean: Optional[torch.Tensor] = None  # [B, n] mixture mean of x_t^- (eq. 20 on the prior)
     nis: Optional[dict] = None
 
 
@@ -524,6 +525,7 @@ class CompactBelief(nn.Module):
             log_posterior=log_post,
             motion_allowed=joints_valid.all(-1) & valid_step,
             predicted_observation=predicted,
+            prior_state_mean=torch.einsum("bk,bkn->bn", weights, prior_mean),
             nis=nis,
         )
         return new_state, output
