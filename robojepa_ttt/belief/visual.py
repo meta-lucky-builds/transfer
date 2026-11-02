@@ -68,30 +68,64 @@ def expand_residual_for_belief(residual: TokenResidual, extra: int) -> TokenResi
     return expanded
 
 
+def check_contract(compact: CompactBelief, sketch: ObservationSketch, model: Optional[AdaptedPredictor] = None) -> None:
+    """Refuse mismatched observation or timing contracts instead of silently misaligning.
+
+    The compact model's visual slots must be the sketch's contract views with the same
+    number of coordinates, and its command blocks must use the visual model's stride,
+    history and tick, because both read the same tick arrays of one batch.
+    """
+    c = compact.config
+    if tuple(c.view_ids) != tuple(sketch.view_ids) or c.visual_per_view != sketch.components:
+        raise ValueError(
+            f"compact contract views {c.view_ids} x {c.visual_per_view} differ from the sketch's "
+            f"{sketch.view_ids} x {sketch.components}"
+        )
+    if model is not None:
+        if (compact.stride, compact.history_ticks) != (model.stride, model.history_ticks) or abs(compact.tick_s - model.tick_s) > 1e-12:
+            raise ValueError("compact and visual models use different stride, history or tick")
+        if compact.units != model.units:
+            raise ValueError("compact and visual models use different unit conventions")
+
+
 def compact_steps(compact: CompactBelief, sketch: ObservationSketch, batch: dict, frames: int) -> list[StepInput]:
-    """StepInputs for keyframes 0..frames-1 of a visual batch.
+    """StepInputs for keyframes 0..frames-1 of a visual batch, in the compact model's dtype.
 
     The visual batch holds tick commands with `history` ticks before keyframe 0, so
-    keyframe k's block (with its history) ends at tick index history + k * stride.
-    Keyframe 0's block would start before the data: it is held at the first command
-    and marked invalid, as data.command_block does at a segment start.
+    the block U_{k-1} that leads into keyframe k ends at tick index history + k*stride
+    and its own history starts `history` ticks before the block. Keyframe 0's block
+    ends at tick `history`, so its history reaches `stride` ticks before the data:
+    those ticks hold the first measured position with validity 0 and nominal
+    duration, as data.command_block and windows.extract_window do before a segment.
+
+    Visual windows are admitted only with every keyframe's joints and views valid
+    (windows.window_is_valid), so joints are all valid here; a contract view that
+    the episode lacks is masked by the sketch.
     """
+    check_contract(compact, sketch)
+    dtype = next(compact.parameters()).dtype
     stride, history = compact.stride, compact.history_ticks
     length = history + stride
-    issued, tick_dt, valid = batch["issued"], batch["dt"], batch["command_valid"].bool()
+    needed = history + (frames - 1) * stride
+    if batch["issued"].shape[1] < needed:
+        raise ValueError(f"batch has {batch['issued'].shape[1]} ticks, {frames} keyframes need {needed}")
+    issued = batch["issued"].to(dtype)
+    tick_dt = batch["dt"].to(dtype)
+    valid = batch["command_valid"].bool()
     pad = stride
-    issued = torch.cat([issued[:, :1].expand(-1, pad, -1), issued], 1)
+    hold = batch["position"][:, :1].to(dtype).expand(-1, pad, -1)
+    issued = torch.cat([hold, issued], 1)
     tick_dt = torch.cat([torch.full_like(tick_dt[:, :1], compact.tick_s).expand(-1, pad), tick_dt], 1)
     valid = torch.cat([torch.zeros_like(valid[:, :1]).expand(-1, pad), valid], 1)
 
-    joints = compact.units.physical_to_compact(batch["position"][:, :frames])
+    joints = compact.units.physical_to_compact(batch["position"][:, :frames].to(dtype))
     B = joints.shape[0]
     visual, view_valid = [], []
     for b in range(B):
         v, ok = sketch.observe(batch["features"][b, :frames], batch["view_ids"][b].tolist())
         visual.append(v)
         view_valid.append(ok)
-    visual = torch.stack(visual).to(joints.dtype)
+    visual = torch.stack(visual).to(dtype)
     view_valid = torch.stack(view_valid)
     joint_valid = torch.ones(B, frames, JOINTS, dtype=torch.bool, device=joints.device)
     mask = torch.cat([joint_valid, view_valid.repeat_interleave(sketch.components, -1)], -1)
@@ -106,7 +140,8 @@ def compact_steps(compact: CompactBelief, sketch: ObservationSketch, batch: dict
                 issued=issued[:, end - length : end],
                 tick_dt=tick_dt[:, end - length : end],
                 command_valid=valid[:, end - length : end],
-                dt=block_dt.sum(-1) if k else torch.full((B,), stride * compact.tick_s, dtype=joints.dtype, device=joints.device),
+                # Frame 0 has no predecessor; its interval is nominal, as in data.py.
+                dt=block_dt.sum(-1) if k else torch.full((B,), stride * compact.tick_s, dtype=dtype, device=joints.device),
             )
         )
     return steps
@@ -134,7 +169,9 @@ def belief_conditioning(
     filter assimilates every frame in `steps` (the realized-motion path), and motion
     is None.
     """
-    frames = context + max(horizon, 0)
+    if horizon < 0 or context < 1:
+        raise ValueError("need context >= 1 and horizon >= 0")
+    frames = context + horizon
     if horizon == 0:
         context = frames = len(steps)
     first = steps[0]
@@ -199,13 +236,25 @@ def belief_visual_loss(
     """L_V of spec 9.7 for B4: 0.25 realized + 0.5 cmdTF + 0.5 AR + 0.05 consistency.
 
     Same shape as offline_train.visual_loss, so OfflineTrainer can take it as loss_fn.
-    The compact model must be frozen while this trains (spec 10.6).
+    The compact model must be frozen while this trains (spec 10.6); everything it
+    produces is computed under no_grad, so this loss cannot reach it in any case.
+    The residual must have been built or expanded with belief_dim(compact) inputs.
     """
+    check_contract(compact, sketch, model)
+    if horizon < 1:
+        raise ValueError("the command losses need a horizon of at least one step")
     frames = batch["features"].shape[1]
+    features_dtype = batch["features"].dtype
     steps = compact_steps(compact, sketch, batch, frames)
     rollout = belief_conditioning(compact, steps[: context + horizon], context, horizon, regimes)
     target = batch["features"][:, context : context + horizon]
-    predicted = model.rollout(batch, context, horizon, motion=rollout.motion.to(batch["position"].dtype), belief=rollout.belief)
+    predicted = model.rollout(
+        batch,
+        context,
+        horizon,
+        motion=rollout.motion.to(batch["position"].dtype),
+        belief=rollout.belief.to(features_dtype),
+    )
     step_losses = [token_metric(predicted[:, k : k + 1], target[:, k : k + 1]) for k in range(horizon)]
     cmd_tf, rollout_loss = step_losses[0], discounted_rollout_loss(step_losses, config.gamma)
     loss = config.weight_cmd_tf * cmd_tf + config.weight_rollout * rollout_loss
@@ -216,7 +265,7 @@ def belief_visual_loss(
         parts["consistency"] = float(cons.detach())
     if use_realized:
         filtered = belief_conditioning(compact, steps, frames, 0, regimes)
-        realized = model.realized_forward(batch, frames, belief=filtered.belief)
+        realized = model.realized_forward(batch, frames, belief=filtered.belief.to(features_dtype))
         realized_loss = token_metric(realized, batch["features"][:, 1:])
         loss = loss + config.weight_realized * realized_loss
         parts["realized"] = float(realized_loss.detach())

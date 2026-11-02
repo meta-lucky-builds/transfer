@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
@@ -16,9 +17,15 @@ FIELDS = ("time_s", "position", "issued", "position_valid", "command_valid", "fr
 
 
 def save_episode(episode: Episode, directory: str | os.PathLike, view_ids: list[int]) -> Path:
+    """One file per episode, named by its id, written atomically.
+
+    The name depends only on the episode id, so parallel preparation shards never
+    collide and a re-run replaces the same file instead of adding a duplicate.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{len(list(directory.glob('*.npz'))):08d}.npz"
+    path = directory / f"{hashlib.sha256(episode.episode_id.encode()).hexdigest()[:24]}.npz"
+    temporary = path.with_name(path.stem + ".tmp.npz")
     arrays = {name: getattr(episode, name)[: episode.length] for name in FIELDS}
     meta = {
         "episode_id": episode.episode_id,
@@ -27,7 +34,8 @@ def save_episode(episode: Episode, directory: str | os.PathLike, view_ids: list[
         "views": episode.views,
         "view_ids": view_ids,
     }
-    np.savez_compressed(path, meta=json.dumps(meta), **arrays)
+    np.savez_compressed(temporary, meta=json.dumps(meta), **arrays)
+    os.replace(temporary, path)
     return path
 
 
