@@ -6,7 +6,15 @@ gpu_acceptance.py reports one max error over a whole 6-frame rollout. This split
 * fp32 versus bf16, so precision effects separate from logic differences,
 * full forward repeated twice, the GPU's own run-to-run noise floor,
 * the planner's cached single step against an uncached forward on the same input,
-  which has no feedback and so cannot compound.
+  which has no feedback and so cannot compound,
+* one bf16 forward against an fp32 forward on identical input: the precision noise
+  of a single pass, the yardstick for every other number.
+
+Upstream sdpa allows only the Flash and memory-efficient kernels. The cached step has
+16 query heads against 8 key/value heads and no mask, which only Flash supports, and
+Flash needs bf16. For an fp32 reference this script also allows PyTorch's math
+kernel, by patching torch.nn.attention.sdpa_kernel inside this process only. The
+upstream code and the training path are untouched.
 
     python scripts/kv_parity_debug.py --predictor-config sources/wm_2b_config.json \
         --weights /workspace/ckpt/cooldown_2b_450k.pth.tar
@@ -20,9 +28,12 @@ something different and must be fixed before KV generation is used.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import traceback
 
 import torch
+from torch.nn.attention import SDPBackend
 
 from _common import build_model
 from gpu_acceptance import fake_batch
@@ -70,6 +81,47 @@ def single_cached_step(model, batch, context):
     return stats(cached, full[:, -1:])
 
 
+_original_sdpa_kernel = torch.nn.attention.sdpa_kernel
+
+
+@contextlib.contextmanager
+def math_allowed():
+    """Add the math kernel to every backend list upstream requests."""
+    def patched(backends, *args, **kwargs):
+        backends = list(backends) if isinstance(backends, (list, tuple)) else [backends]
+        if SDPBackend.MATH not in backends:
+            backends.append(SDPBackend.MATH)
+        return _original_sdpa_kernel(backends, *args, **kwargs)
+
+    torch.nn.attention.sdpa_kernel = patched
+    try:
+        yield
+    finally:
+        torch.nn.attention.sdpa_kernel = _original_sdpa_kernel
+
+
+def guarded(function, *args):
+    try:
+        return function(*args)
+    except Exception as error:  # report and continue: one failure must not hide the rest
+        return {"error": f"{type(error).__name__}: {error}", "trace": traceback.format_exc(limit=3)}
+
+
+@torch.no_grad()
+def precision_single_forward(model, batch, context):
+    """Same input, one forward, bf16 versus fp32 (math kernel allowed)."""
+    actions, states = model.sequence_inputs(batch, context, 1)
+    command = model.encode_commands(batch, context)
+    args = (batch["features"][:, :context], actions, states, batch["view_ids"], command)
+    model.amp_dtype = torch.bfloat16
+    with model.amp():
+        low = model.forward_tokens(*args)
+    model.amp_dtype = None
+    with math_allowed():
+        high = model.forward_tokens(*args)
+    return stats(low, high)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--predictor-config", required=True)
@@ -86,14 +138,20 @@ def main():
     model.set_trainable("none")
     batch = fake_batch(2, 10, args.device)
     report = {"gpu": torch.cuda.get_device_name(0), "torch": torch.__version__}
-    for label, dtype in (("fp32", None), ("bf16", torch.bfloat16)):
+    report["bf16_vs_fp32_single_forward"] = guarded(precision_single_forward, model, batch, 4)
+    print("bf16 vs fp32, one forward:", json.dumps(report["bf16_vs_fp32_single_forward"])[:300], flush=True)
+    for label, dtype, context_manager in (
+        ("bf16", torch.bfloat16, contextlib.nullcontext),
+        ("fp32_math_allowed", None, math_allowed),
+    ):
         model.amp_dtype = dtype
-        report[label] = {
-            "planner_single_cached_step": single_cached_step(model, batch, 4),
-            "context2_horizon6": generation_errors(model, batch, 2, 6),
-            "context4_horizon3": generation_errors(model, batch, 4, 3),
-        }
-        print(label, json.dumps(report[label]["planner_single_cached_step"]), flush=True)
+        with context_manager():
+            report[label] = {
+                "planner_single_cached_step": guarded(single_cached_step, model, batch, 4),
+                "context2_horizon6": guarded(generation_errors, model, batch, 2, 6),
+                "context4_horizon3": guarded(generation_errors, model, batch, 4, 3),
+            }
+        print(label, "single cached step:", json.dumps(report[label]["planner_single_cached_step"])[:300], flush=True)
     print(json.dumps(report, indent=2))
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
