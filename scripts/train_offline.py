@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,6 +34,39 @@ from robojepa_ttt.evaluation.prediction import rollout_errors
 from robojepa_ttt.learning.distributed import cleanup, init_distributed
 from robojepa_ttt.learning.offline_train import OfflineTrainer
 from robojepa_ttt.learning.windows import WindowSpec
+
+
+class Prefetcher:
+    """Builds the next training batches in a background thread while the GPU computes.
+
+    One producer thread calls the sampler in order, so batches and their order are
+    exactly those of calling it directly; only disk reads and collation overlap with
+    compute. CUDA batches are pinned in the thread so the copy is asynchronous.
+    """
+
+    def __init__(self, produce, device, depth: int = 2):
+        self.device = torch.device(device)
+        self.items: queue.Queue = queue.Queue(maxsize=depth)
+        pin = self.device.type == "cuda"
+
+        def work():
+            while True:
+                try:
+                    batch = produce()
+                    if pin:
+                        batch = {k: v.pin_memory() for k, v in batch.items()}
+                    self.items.put(batch)
+                except BaseException as error:  # surface it in the training thread
+                    self.items.put(error)
+                    return
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def __call__(self) -> dict:
+        item = self.items.get()
+        if isinstance(item, BaseException):
+            raise item
+        return {k: v.to(self.device, non_blocking=True) for k, v in item.items()}
 
 
 def main():
@@ -55,6 +90,8 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None, help="evaluations without improvement before stopping")
     parser.add_argument("--validation-windows", type=int, default=64, help="fixed validation windows (kept on CPU)")
+    parser.add_argument("--no-checkpointing", action="store_true",
+                        help="keep activations instead of recomputing them: ~25-30%% faster, more memory")
     args = parser.parse_args()
 
     dist = init_distributed()
@@ -97,40 +134,43 @@ def main():
         spec,
         feature_cache(args.features, spec.stride, budget),
         config.microbatch,
-        device,
+        "cpu",  # assembled on the CPU by the prefetch thread, then copied asynchronously
         config.seed + 1000 * dist.rank,  # each rank draws its own windows
     )
-    fixed_validation = []
-    if dist.is_main:  # only rank 0 validates
-        validation = KeyframeSampler(
-            validation_episodes,
-            validation_views,
-            spec,
-            feature_cache(args.validation_features or args.features, spec.stride, budget // 4),
-            config.microbatch,
-            "cpu",  # kept off the GPU until used: at 2B one window is ~64 MB of features
-            config.seed,
-        )
-        fixed_validation = list(validation.ordered_batches(args.validation_windows))
+    # Every rank builds the same fixed set and scores its own share (rank::world_size).
+    validation = KeyframeSampler(
+        validation_episodes,
+        validation_views,
+        spec,
+        feature_cache(args.validation_features or args.features, spec.stride, budget // 4),
+        config.microbatch,
+        "cpu",  # kept off the GPU until used: at 2B one window is ~64 MB of features
+        config.seed,
+    )
+    fixed_validation = list(validation.ordered_batches(args.validation_windows))[dist.rank :: dist.world_size]
+    if dist.is_main:
         print(
             f"ranks {dist.world_size}, windows: train {train.total}, validation {validation.total}, "
-            f"fixed validation batches {len(fixed_validation)}"
+            f"fixed validation batches per rank ~{len(fixed_validation)}"
         )
 
     model = build_model(
-        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=True,
+        args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=not args.no_checkpointing,
         timing=timing,
     )
     trainer = OfflineTrainer(model, config, args.out, dist)
     if trainer.resume() and dist.is_main:
         print(f"resumed at update {trainer.update}")
 
-    def validate(current) -> float:
-        errors = []
+    def validate(current):
+        """(sum of per-window errors, window count) over this rank's share."""
+        total, count = 0.0, 0
         for batch in fixed_validation:
             on_device = {k: v.to(device) for k, v in batch.items()}
-            errors.append(rollout_errors(current, on_device, 2, 5).mean())
-        return float(np.mean(errors))
+            errors = rollout_errors(current, on_device, 2, 5).mean(axis=1)  # per window
+            total += float(errors.sum())
+            count += len(errors)
+        return total, count
 
     if dist.is_main:
         print(json.dumps({"config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(config).items()}}), flush=True)
@@ -139,7 +179,9 @@ def main():
         if record["update"] % 20 == 0 or "validation" in record:
             print(json.dumps(record), flush=True)
 
-    result = trainer.fit(train.next_batch, validate, log)
+    result = trainer.fit(Prefetcher(train.next_batch, device), validate, log, validate_all_ranks=True)
+    if torch.cuda.is_available() and dist.is_main:
+        print(json.dumps({"peak_gpu_gb_rank0": torch.cuda.max_memory_allocated() / 1e9}), flush=True)
     if dist.is_main:
         print(result)
         Path(args.out, "log.json").write_text(json.dumps(trainer.log), encoding="utf-8")

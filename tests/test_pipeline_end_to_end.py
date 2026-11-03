@@ -82,7 +82,7 @@ def test_full_pipeline_on_cpu(tmp_path):
 
     env = dict(
         os.environ, WORK=str(work), DATA=str(data), RUN=str(work / "run"), DEVICE="cpu", NGPU="2", SKIP_PREP="1",
-        STAGES="split units servo smoke train eval", PRED_CONFIG=str(pred_config), WEIGHTS=str(weights),
+        STAGES="split units servo smoke train belief eval", PRED_CONFIG=str(pred_config), WEIGHTS=str(weights),
         SETTINGS=str(settings_path), B1_MAX_UPDATES="6", B1_WARMUP="2", B1_CURRICULUM="3:2,3:5", B1_VAL_INTERVAL="3",
         BELIEF_MAX_UPDATES="4", BELIEF_VAL_INTERVAL="2", OMP_NUM_THREADS="2",
     )
@@ -90,7 +90,7 @@ def test_full_pipeline_on_cpu(tmp_path):
     log = result.stdout + result.stderr
     assert result.returncode == 0, log[-6000:]
     run = work / "run"
-    for stage in ("split", "units", "servo", "smoke", "train", "eval"):
+    for stage in ("split", "units", "servo", "smoke", "train", "belief", "eval"):
         assert (run / f".done_{stage}").exists(), stage
 
     b1_log = (run / "logs" / "b1.log").read_text()
@@ -101,6 +101,8 @@ def test_full_pipeline_on_cpu(tmp_path):
     report = json.loads((run / "b0_vs_b1.json").read_text())
     assert {"h1", "h2", "h5"} <= set(report)
     belief = json.loads((run / "belief" / "report.json").read_text())
+    assert (run / "sketch.pt").exists() and (run / "belief_seed1" / "belief.pt").exists()
+    assert json.loads((run / "belief_seeds.json").read_text())["selected_seed"] == 1
     assert np.isfinite(belief["validation_nll"]) and "calibration" in belief
     units_json = json.loads((data / "units.json").read_text())
     assert units_json["use_degrees"] and len(units_json["center"]) == 6

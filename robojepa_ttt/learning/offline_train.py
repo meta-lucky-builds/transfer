@@ -207,11 +207,22 @@ class OfflineTrainer:
         self.update += 1
         return {"update": self.update, "loss": total_loss, "grad_norm": float(grad_norm), "horizon": horizon, **totals}
 
+    def _score(self, validate, all_ranks: bool) -> float:
+        if all_ranks:
+            total, count = validate(self.model)
+            reduced = all_reduce_sum({"total": float(total), "count": float(count)}, self.dist, next(self.model.parameters()).device)
+            if reduced["count"] <= 0:
+                raise ValueError("validation set is empty")
+            return reduced["total"] / reduced["count"]
+        score = validate(self.model) if self.dist.is_main else None
+        return broadcast_object(score, self.dist)
+
     def fit(
         self,
         next_batch: Callable[[], dict],
         validate: Callable[[AdaptedPredictor], float],
         log: Optional[Callable[[dict], None]] = None,
+        validate_all_ranks: bool = False,
     ) -> dict:
         """Train with early stopping on validation command prediction.
 
@@ -219,14 +230,15 @@ class OfflineTrainer:
         remaining curriculum just to match a schedule (spec 10.6).
 
         Only rank 0 calls validate; the score is broadcast so all ranks agree on the
-        best checkpoint and on when to stop.
+        best checkpoint and on when to stop. With validate_all_ranks, every rank calls
+        validate on its own share of the fixed set and returns (sum, count); the
+        reduced mean is identical to one rank scoring everything, and no rank idles.
         """
         started = time.time()
         while self.update < self.config.max_updates:
             record = self.train_step(next_batch)
             if self.update % self.config.validation_interval == 0:
-                score = validate(self.model) if self.dist.is_main else None
-                record["validation"] = broadcast_object(score, self.dist)
+                record["validation"] = self._score(validate, validate_all_ranks)
                 if record["validation"] < self.best:
                     self.best = record["validation"]
                     self.stale = 0
@@ -241,8 +253,7 @@ class OfflineTrainer:
                 break
         if self.update % self.config.validation_interval:
             # The last updates since a validation would otherwise never be scored or saved.
-            score = validate(self.model) if self.dist.is_main else None
-            score = broadcast_object(score, self.dist)
+            score = self._score(validate, validate_all_ranks)
             if score < self.best:
                 self.best, self.stale = score, 0
                 self._save("best.pt")

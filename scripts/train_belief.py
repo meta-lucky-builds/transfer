@@ -83,6 +83,9 @@ def main():
     parser.add_argument("--feature-cache-gb", type=float, default=20.0)
     parser.add_argument("--max-updates", type=int, default=None, help="override, e.g. for a smoke run")
     parser.add_argument("--validation-interval", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None, help="model init and sampling; default: the YAML seed")
+    parser.add_argument("--sketch-path", default=None, help="shared sketch file; fitted and saved here if missing")
+    parser.add_argument("--sketch-only", action="store_true", help="fit and save the sketch, then exit")
     args = parser.parse_args()
 
     settings = load_settings(args.settings) if args.settings else load_settings()
@@ -103,7 +106,9 @@ def main():
     print(f"contract views {args.views}; {missing}/{len(train_eps)} training episodes lack one (those slots are masked)")
     cache = feature_cache(args.features, stride, int(args.feature_cache_gb * 1e9))
 
-    sketch_path = out / "sketch.pt"
+    seed = raw["seed"] if args.seed is None else args.seed
+    torch.manual_seed(seed)  # model initialisation; the sketch fit keeps the YAML seed so seeds share it
+    sketch_path = Path(args.sketch_path) if args.sketch_path else out / "sketch.pt"
     first = train_eps[0]
     token_dim = cache.get(first.encoder_hash, first.episode_id, 0).shape[-1]
     sketch = ObservationSketch(args.views, token_dim=token_dim, components=raw["representation"]["sketch"]["pca_dims_per_view"])
@@ -114,8 +119,12 @@ def main():
         report = sketch.fit(
             {v: sketch_frames(train_eps, train_views, cache, v, stride, args.sketch_frames, raw["seed"]) for v in args.views}
         )
-        torch.save(sketch.state_dict(), sketch_path)
+        temporary = sketch_path.with_suffix(".tmp")
+        torch.save(sketch.state_dict(), temporary)
+        temporary.replace(sketch_path)  # atomic: a parallel reader never sees half a file
         print(f"fitted sketch {sketch.digest()} on training frames only: {json.dumps(report)}")
+    if args.sketch_only:
+        return
 
     bound = args.residual_bound or residual_bound_from_data(train_eps, units, stride)
     config = compact_config(settings, args.joint_sensor_std, bound, args.views)
@@ -148,14 +157,14 @@ def main():
         weight_regularity=compact_raw["loss_weights"]["regularity"],
         weight_regime_ce=compact_raw["loss_weights"]["supervised_regime_ce_when_available"],
         differentiable_jacobian=not args.surrogate_jacobian,
-        seed=raw["seed"],
+        seed=seed,
     )
     if args.surrogate_jacobian:
         print("SURROGATE GRADIENT ABLATION: Jacobians detached (spec 9.3). Report it under that name.")
     trainer = CompactTrainer(model, train_config, joint_scale, out)
     if trainer.resume():
         print(f"resumed at update {trainer.update}")
-    rng = random.Random(raw["seed"])
+    rng = random.Random(seed)
 
     def log(record):
         if record["update"] % 20 == 0 or "validation_nll" in record:
@@ -171,7 +180,7 @@ def main():
         cal_batches = cal.fixed(256, 32, device=args.device)
         report["calibration"] = fit_calibration(model, cal_batches, joint_scale)
         report["innovations_after_calibration"] = innovation_summary(model, cal_batches)
-    torch.save({"model": model.state_dict(), "config": config, "sketch_digest": sketch.digest(), "joint_scale": joint_scale.cpu()}, out / "belief.pt")
+    torch.save({"model": model.state_dict(), "config": config, "sketch_digest": sketch.digest(), "joint_scale": joint_scale.cpu(), "seed": seed}, out / "belief.pt")
     (out / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
 

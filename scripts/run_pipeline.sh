@@ -35,7 +35,12 @@ B1_VAL_INTERVAL="${B1_VAL_INTERVAL:-250}"
 B1_PATIENCE="${B1_PATIENCE:-4}"
 BELIEF_MAX_UPDATES="${BELIEF_MAX_UPDATES:-4000}"
 BELIEF_VAL_INTERVAL="${BELIEF_VAL_INTERVAL:-500}"
-STAGES="${STAGES:-setup prepare split units servo smoke train eval}"
+STAGES="${STAGES:-setup prepare split units servo smoke train belief eval}"
+# Preparation is CPU-bound (AV1 decoding); several processes per GPU keep the GPUs busy.
+PREP_PER_GPU="${PREP_PER_GPU:-4}"
+# 1 = recompute activations (slower, less memory). Off by default: 2 sequences per 96 GB GPU fit.
+CHECKPOINTING="${CHECKPOINTING:-0}"
+EVAL_BATCH="${EVAL_BATCH:-16}"
 SKIP_PREP="${SKIP_PREP:-0}"
 
 if [ "$DEVICE" = "cuda" ]; then NGPU="${NGPU:-$(nvidia-smi -L | wc -l)}"; else NGPU="${NGPU:-2}"; fi
@@ -77,11 +82,15 @@ if want prepare && ! done_marker prepare && [ "$SKIP_PREP" != "1" ]; then
   python scripts/prepare_lerobot.py "${COMMON[@]}" --episodes-per-task 1 --block 1 --out "$WORK/data/pilot" > "$RUN/logs/pilot.log" 2>&1 \
     || { tail -30 "$RUN/logs/pilot.log"; echo "STOP: pilot preparation failed"; exit 1; }
   python -c "import torch, glob; f=sorted(glob.glob('$WORK/data/pilot/features/*.pt')); t=torch.load(f[0]); assert t.shape[1:] == (2, 15, 20, 1664), t.shape; assert torch.isfinite(t.float()).all(); print('PILOT OK', len(f), tuple(t.shape))"
-  say "prepare: $EPISODES_PER_TASK per task on $NGPU GPUs"
+  SHARDS=$((NGPU * PREP_PER_GPU))
+  CORES=$(nproc)
+  THREADS=$(( CORES / SHARDS > 1 ? CORES / SHARDS : 1 ))
+  say "prepare: $EPISODES_PER_TASK per task, $SHARDS processes on $NGPU GPUs, $THREADS decode threads each"
   pids=()
-  for i in $(seq 0 $((NGPU - 1))); do
-    CUDA_VISIBLE_DEVICES=$i python scripts/prepare_lerobot.py "${COMMON[@]}" --episodes-per-task "$EPISODES_PER_TASK" --block 10 \
-      --shard "$i" --num-shards "$NGPU" --out "$DATA" > "$RUN/logs/prepare_$i.log" 2>&1 &
+  for i in $(seq 0 $((SHARDS - 1))); do
+    CUDA_VISIBLE_DEVICES=$((i % NGPU)) ROBOJEPA_DECODE_THREADS=$THREADS OMP_NUM_THREADS=2 \
+      python scripts/prepare_lerobot.py "${COMMON[@]}" --episodes-per-task "$EPISODES_PER_TASK" --block 10 \
+      --shard "$i" --num-shards "$SHARDS" --out "$DATA" > "$RUN/logs/prepare_$i.log" 2>&1 &
     pids+=($!)
   done
   for i in "${!pids[@]}"; do
@@ -115,52 +124,94 @@ BELIEF_ARGS=(--units "$DATA/units.json" --servo "$DATA/servo.json" --train "$SPL
              --validation "$SPLITS/validation/episodes" --features "$DATA/features" --views $VIEWS
              --joint-sensor-std "$JOINT_SENSOR_STD" --device "$DEVICE" "${SET[@]}")
 
+CKPT_FLAG=(); [ "$CHECKPOINTING" = "1" ] || CKPT_FLAG=(--no-checkpointing)
+
 if want smoke && ! done_marker smoke; then
-  say "smoke: 2 updates of B1 and of the belief on real features"
+  say "smoke, in parallel: B1 at the real per-GPU microbatch ($MICRO) and memory setting, and the belief"
   rm -rf "$RUN/smoke_b1" "$RUN/smoke_belief"
-  python scripts/train_offline.py "${B1_ARGS[@]}" --out "$RUN/smoke_b1" --max-updates 2 --warmup-updates 1 --curriculum 2:2 \
-    --validation-interval 1 --validation-windows 4 --microbatch 1 > "$RUN/logs/smoke_b1.log" 2>&1 \
-    || { tail -40 "$RUN/logs/smoke_b1.log"; echo "STOP: B1 smoke run failed"; exit 1; }
+  # The longest curriculum horizon is the most memory-hungry step; smoke it.
+  LONGEST=$(echo "$B1_CURRICULUM" | tr ',' '\n' | cut -d: -f2 | sort -n | tail -1)
+  CUDA_VISIBLE_DEVICES=0 python scripts/train_offline.py "${B1_ARGS[@]}" --out "$RUN/smoke_b1" --max-updates 2 --warmup-updates 1 \
+    --curriculum "2:$LONGEST" --validation-interval 1 --validation-windows 4 --microbatch "$MICRO" "${CKPT_FLAG[@]}" \
+    > "$RUN/logs/smoke_b1.log" 2>&1 &
+  b1_smoke=$!
+  CUDA_VISIBLE_DEVICES=$((NGPU > 1 ? 1 : 0)) python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/smoke_belief" \
+    --max-updates 2 --validation-interval 1 --sketch-frames 2000 > "$RUN/logs/smoke_belief.log" 2>&1 &
+  belief_smoke=$!
+  if ! wait "$b1_smoke"; then
+    tail -40 "$RUN/logs/smoke_b1.log"
+    grep -qi "out of memory" "$RUN/logs/smoke_b1.log" && echo "STOP: B1 ran out of memory; re-run with CHECKPOINTING=1" || echo "STOP: B1 smoke run failed"
+    exit 1
+  fi
   grep -q '"validation"' "$RUN/logs/smoke_b1.log" && test -f "$RUN/smoke_b1/best.pt" || { tail -20 "$RUN/logs/smoke_b1.log"; echo "STOP: B1 smoke produced no validated checkpoint"; exit 1; }
-  python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/smoke_belief" --max-updates 2 --validation-interval 1 \
-    --sketch-frames 2000 > "$RUN/logs/smoke_belief.log" 2>&1 \
-    || { tail -40 "$RUN/logs/smoke_belief.log"; echo "STOP: belief smoke run failed"; exit 1; }
+  wait "$belief_smoke" || { tail -40 "$RUN/logs/smoke_belief.log"; echo "STOP: belief smoke run failed"; exit 1; }
   test -f "$RUN/smoke_belief/belief.pt" || { echo "STOP: belief smoke wrote no model"; exit 1; }
+  grep -h "peak_gpu_gb" "$RUN/logs/smoke_b1.log" || true
   echo "smoke OK"
   mark smoke
 fi
 
 if want train && ! done_marker train; then
-  say "train: B1 on $NGPU GPUs (microbatch $MICRO each) and the belief on GPU $((NGPU - 1)), in parallel"
-  CUDA_VISIBLE_DEVICES=$((NGPU - 1)) nohup python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/belief" \
-    --calibration "$SPLITS/calibration/episodes" --max-updates "$BELIEF_MAX_UPDATES" --validation-interval "$BELIEF_VAL_INTERVAL" \
-    > "$RUN/logs/belief.log" 2>&1 &
-  belief_pid=$!
-  if [ "$DEVICE" = "cuda" ]; then LAUNCH=(torchrun --standalone --nproc_per_node "$NGPU"); else LAUNCH=(torchrun --standalone --nproc_per_node "$NGPU"); fi
-  "${LAUNCH[@]}" scripts/train_offline.py "${B1_ARGS[@]}" --out "$RUN/b1" --microbatch "$MICRO" \
+  # B1 alone on every GPU. Nothing else shares a GPU with a data-parallel rank: every rank
+  # waits for the slowest one at each step, so one shared GPU would slow all of them.
+  say "train B1: data parallel on all $NGPU GPUs, microbatch $MICRO each, nothing else on them"
+  torchrun --standalone --nproc_per_node "$NGPU" scripts/train_offline.py "${B1_ARGS[@]}" --out "$RUN/b1" --microbatch "$MICRO" "${CKPT_FLAG[@]}" \
     --max-updates "$B1_MAX_UPDATES" --warmup-updates "$B1_WARMUP" --curriculum "$B1_CURRICULUM" \
     --validation-interval "$B1_VAL_INTERVAL" --patience "$B1_PATIENCE" > "$RUN/logs/b1.log" 2>&1 \
-    || { tail -40 "$RUN/logs/b1.log"; echo "STOP: B1 training failed (belief keeps running, pid $belief_pid)"; exit 1; }
+    || { tail -40 "$RUN/logs/b1.log"; echo "STOP: B1 training failed"; exit 1; }
   echo "B1 finished: $(grep -o "{'updates'.*" "$RUN/logs/b1.log" | tail -1)"
-  wait "$belief_pid" || { tail -40 "$RUN/logs/belief.log"; echo "STOP: belief training failed"; exit 1; }
-  echo "belief finished"
+  grep -h "peak_gpu_gb" "$RUN/logs/b1.log" || true
   mark train
+fi
+
+run_eval() {
+  python scripts/evaluate_b0_b1.py --predictor-config "$PRED_CONFIG" --weights "$WEIGHTS" --units "$DATA/units.json" \
+    --servo "$DATA/servo.json" --episodes "$SPLITS/test/episodes" --features "$DATA/features" \
+    --adapters "$RUN/b1/best.pt" --device "$DEVICE" --batch "$EVAL_BATCH" "${SET[@]}" > "$RUN/b0_vs_b1.json" 2> "$RUN/logs/eval.log"
+}
+
+if want belief && ! done_marker belief; then
+  # Independent jobs, one per GPU: B0-vs-B1 evaluation on GPU 0, belief seeds on the others.
+  # Spec 19.4 asks for at least three independently trained seeds.
+  SEEDS=$(( NGPU > 1 ? NGPU - 1 : 1 ))
+  say "belief: shared sketch, then $SEEDS seeds on GPUs 1..$SEEDS, with evaluation on GPU 0 alongside"
+  CUDA_VISIBLE_DEVICES=0 python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/belief_sketch" \
+    --sketch-path "$RUN/sketch.pt" --sketch-only > "$RUN/logs/sketch.log" 2>&1 \
+    || { tail -30 "$RUN/logs/sketch.log"; echo "STOP: sketch fit failed"; exit 1; }
+  eval_pid=""
+  if want eval && ! done_marker eval; then
+    CUDA_VISIBLE_DEVICES=0 run_eval &
+    eval_pid=$!
+  fi
+  pids=()
+  for k in $(seq 1 "$SEEDS"); do
+    gpu=$(( NGPU > 1 ? k : 0 ))
+    CUDA_VISIBLE_DEVICES=$gpu python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/belief_seed$k" --seed $((100 + k)) \
+      --sketch-path "$RUN/sketch.pt" --calibration "$SPLITS/calibration/episodes" \
+      --max-updates "$BELIEF_MAX_UPDATES" --validation-interval "$BELIEF_VAL_INTERVAL" > "$RUN/logs/belief_seed$k.log" 2>&1 &
+    pids+=($!)
+  done
+  for k in "${!pids[@]}"; do
+    wait "${pids[$k]}" || { tail -30 "$RUN/logs/belief_seed$((k + 1)).log"; echo "STOP: belief seed $((k + 1)) failed"; exit 1; }
+  done
+  # The seed with the lowest VALIDATION NLL becomes the belief; test data never selects it.
+  python scripts/select_belief_seed.py --run "$RUN" --seeds "$SEEDS"
+  if [ -n "$eval_pid" ]; then
+    wait "$eval_pid" || { tail -30 "$RUN/logs/eval.log"; echo "STOP: evaluation failed"; exit 1; }
+    mark eval
+  fi
+  mark belief
 fi
 
 if want eval && ! done_marker eval; then
   say "evaluate B0 (zero adapters) against B1 on the untouched test split"
-  python scripts/evaluate_b0_b1.py --predictor-config "$PRED_CONFIG" --weights "$WEIGHTS" --units "$DATA/units.json" \
-    --servo "$DATA/servo.json" --episodes "$SPLITS/test/episodes" --features "$DATA/features" \
-    --adapters "$RUN/b1/best.pt" --device "$DEVICE" "${SET[@]}" | tee "$RUN/b0_vs_b1.json"
-  python - "$RUN/belief/report.json" <<'EOF'
-import json, sys
-report = json.load(open(sys.argv[1]))
-print("belief validation NLL per coordinate:", round(report["validation_nll"], 4))
-for name, block in report.get("innovations_after_calibration", report.get("innovations", {})).items():
-    print(f"  {name}: NIS per coordinate {block['nis_per_coordinate']:.3f} (1 is calibrated)")
-if "calibration" in report:
-    print("calibration multipliers:", [round(m, 3) for m in report["calibration"]["multipliers"]])
-EOF
+  run_eval || { tail -30 "$RUN/logs/eval.log"; echo "STOP: evaluation failed"; exit 1; }
   mark eval
+fi
+
+if [ -f "$RUN/b0_vs_b1.json" ] && [ -f "$RUN/belief/report.json" ]; then
+  say "results"
+  cat "$RUN/b0_vs_b1.json"
+  python scripts/select_belief_seed.py --run "$RUN" --summary
 fi
 say "pipeline finished; results in $RUN"

@@ -54,7 +54,8 @@ def encode_frames(encoder, frames: torch.Tensor, device, dtype=torch.bfloat16, b
     outputs = []
     patch = encoder.vit.patch_size
     for start in range(0, frames.shape[0], batch):
-        pixels = preprocess(frames[start : start + batch]).to(device)
+        # Resize and normalise on the device: on CPU, shrinking 576x1024 frames dominated encoding.
+        pixels = preprocess(frames[start : start + batch].to(device, non_blocking=True))
         grid_h, grid_w = pixels.shape[-2] // patch, pixels.shape[-1] // patch
         with torch.autocast(device_type=torch.device(device).type, dtype=dtype):
             tokens = encoder(pixels[:, :, None])  # one frame per image, as in V-JEPA 2.1

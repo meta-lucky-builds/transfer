@@ -22,6 +22,7 @@ refusing any frame further than half a frame period away.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
@@ -152,6 +153,9 @@ class LeRobotV3Source:
         with av.open(str(self.local(self.video_file(episode, camera)))) as container:
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
+            threads = int(os.environ.get("ROBOJEPA_DECODE_THREADS", "0"))
+            if threads > 0:  # many preparation processes share the CPU; split the cores between them
+                stream.codec_context.thread_count = threads
             container.seek(max(int((wanted.min() - 1.0) / stream.time_base), 0), stream=stream, backward=True)
             for frame in container.decode(stream):
                 if frame.pts is None:
