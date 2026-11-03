@@ -82,11 +82,29 @@ def main():
             print(f"whole dataset: about {keyframes:,.0f} keyframes, about {keyframes * 2e6 / 1e9:,.0f} GB of features for two views")
     if "task_index" in frame:
         print(f"\ntask mix in sampled frames: {frame['task_index'].value_counts().sort_index().to_dict()}")
-    tasks = root / "meta" / "tasks.jsonl"
-    if tasks.exists():
-        print("\ntasks:")
-        for line in tasks.read_text().splitlines()[:20]:
+    # LeRobot v3 keeps tasks in meta/tasks.parquet; v2.x and some uploads in tasks.jsonl.
+    if (root / "meta" / "tasks.parquet").exists():
+        print("\ntasks (meta/tasks.parquet):")
+        print(pd.read_parquet(root / "meta" / "tasks.parquet").head(20).to_string())
+    elif (root / "meta" / "tasks.jsonl").exists():
+        print("\ntasks (meta/tasks.jsonl):")
+        for line in (root / "meta" / "tasks.jsonl").read_text().splitlines()[:20]:
             print(" ", line)
+    # v3 per-episode metadata covers EVERY episode, not just the sampled data files.
+    episode_files = sorted((root / "meta" / "episodes").glob("**/*.parquet")) if (root / "meta" / "episodes").exists() else []
+    if episode_files:
+        episodes = pd.concat([pd.read_parquet(f) for f in episode_files], ignore_index=True)
+        print(f"\nmeta/episodes: {len(episodes)} episodes; columns: {list(episodes.columns)[:25]}")
+        if "length" in episodes:
+            lengths = episodes["length"].to_numpy()
+            print(f"all episodes, length in frames: min {lengths.min()} median {int(np.median(lengths))} max {lengths.max()} total {lengths.sum()}")
+            for count in (200, 400, 800):
+                chosen = np.sort(lengths)[len(lengths) // 2] * min(count, len(lengths))
+                print(f"  ~{count} median-length episodes: ~{chosen / ticks:,.0f} keyframes, ~{chosen / ticks * 2e6 / 1e9:,.0f} GB features for two views")
+        for column in ("tasks", "task_index"):
+            if column in episodes:
+                print(f"episodes per {column}: {episodes[column].astype(str).value_counts().to_dict()}")
+                break
 
 
 if __name__ == "__main__":
