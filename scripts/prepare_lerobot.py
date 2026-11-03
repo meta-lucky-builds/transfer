@@ -1,20 +1,23 @@
-"""Import one LeRobot dataset: write episodes, encode keyframes, record dataset.json.
+"""Import one LeRobot v3 dataset: write episodes, encode keyframes, record dataset.json.
 
-Unit choices are required arguments on purpose: run scripts/inspect_lerobot.py first
-and read the joint ranges. See robojepa_ttt/data/import_lerobot.py for what imported
-data cannot provide.
+Uses robojepa_ttt/data/lerobot_v3.py, not the lerobot package (which pins torch < 2.12
+and so cannot share an NGC container's torch 2.14). Only the data and video files that
+hold the selected episodes are downloaded. Run scripts/inspect_lerobot.py first and read
+the joint ranges: unit choices are required arguments on purpose.
 
-    python scripts/prepare_lerobot.py --repo-id armnet/armnetbench_v01_lerobot_so101 \
+    HF_HOME=/workspace/hf_cache python scripts/prepare_lerobot.py \
+        --repo-id armnet/armnetbench_v01_lerobot_so101 \
         --use-degrees --gripper-closed 0 --gripper-open 100 --gripper-verified \
-        --cameras front=6 top=5 --max-episodes 400 \
+        --cameras front=6 top=5 --episodes-per-task 50 \
         --encoder /workspace/ckpt/vjepa2_1_vitG_384.pt --out /workspace/data/armnet
 
-Frame rate comes from the dataset (20 fps -> 4 ticks per 0.2 s step, 30 fps -> 6).
-Cameras: name=semantic_id with RoboJEPA's view_map (left 0, right 1, top 5, front 6).
-The wrist id 2 is refused: the target rig has two fixed phone cameras and no wrist
-camera, so training must not lean on a wrist view. Unlisted cameras are skipped.
+Frame rate comes from the dataset (20 fps -> 4 ticks per 0.2 s step). Cameras map to
+RoboJEPA's view_map (left 0, right 1, top 5, front 6); the wrist id 2 is refused, because
+the target rig has two fixed phone cameras and no wrist camera. Unlisted cameras are
+never downloaded.
 
-Several GPUs: run one process per GPU on disjoint shards of the same selection.
+Several GPUs: one process per GPU on disjoint shards of the same deterministic selection.
+Episodes are sharded by data file so shards rarely share downloads.
 
     for i in 0 1 2 3; do CUDA_VISIBLE_DEVICES=$i python scripts/prepare_lerobot.py ... \
         --shard $i --num-shards 4 > prep_$i.log 2>&1 & done; wait
@@ -24,9 +27,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
-from collections import defaultdict
+import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -35,51 +38,60 @@ import _common  # noqa: F401  sets the import path
 from robojepa_ttt.data.dataset_meta import DatasetMeta, parse_cameras, timing_for
 from robojepa_ttt.data.feature_store import DiskFeatures, encode_frames, encoder_hash
 from robojepa_ttt.data.import_lerobot import check_dataset_info, episode_from_arrays
+from robojepa_ttt.data.lerobot_v3 import LeRobotV3Source, select_blocks
 from robojepa_ttt.data.offline_dataset import save_episode
-from robojepa_ttt.models.upstream import add_upstream_to_path
 from robojepa_ttt.robot_io.so101_units import So101Units
 
 
-def open_dataset(repo_id: str):
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    except ImportError:
-        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-    return LeRobotDataset(repo_id)
+def shard_of(source: LeRobotV3Source, selected: list[int], num_shards: int) -> dict[int, int]:
+    """Assign episodes to shards by data file, balancing episode counts greedily."""
+    groups: dict[str, list[int]] = {}
+    for episode in selected:
+        groups.setdefault(source.data_file(episode), []).append(episode)
+    load = [0] * num_shards
+    assignment: dict[int, int] = {}
+    for _, members in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        target = min(range(num_shards), key=lambda s: (load[s], s))
+        for episode in members:
+            assignment[episode] = target
+        load[target] += len(members)
+    return assignment
 
 
-def select_episodes(episode_index: np.ndarray, task_index: np.ndarray | None, limit: int | None, seed: int) -> list[int]:
-    """Deterministic, task-balanced choice of source episodes (identical on every shard).
+def prepare(
+    source: LeRobotV3Source,
+    episodes: list[int],
+    cameras: dict[str, int],
+    units: So101Units,
+    encode: Callable[[np.ndarray], torch.Tensor],
+    hash_id: str,
+    out: Path,
+    shard: int = 0,
+    num_shards: int = 1,
+    log: Callable[[str], None] = print,
+) -> list[dict]:
+    """Write episodes and keyframe features for `episodes`; return the manifest rows.
 
-    Round-robin over tasks in shuffled order, so each task contributes as evenly as its
-    episode count allows. Returned sorted, which keeps neighbouring episodes together
-    for session-like splitting.
+    encode maps uint8 frames [K, H, W, 3] to features [K, rows, cols, C].
     """
-    episodes = sorted(int(e) for e in np.unique(episode_index))
-    if limit is None or limit >= len(episodes):
-        return episodes
-    rng = random.Random(seed)
-    by_task: dict[int, list[int]] = defaultdict(list)
-    if task_index is None:
-        by_task[0] = episodes
-    else:
-        first_row = {}
-        for row, e in enumerate(episode_index):
-            first_row.setdefault(int(e), row)
-        for e in episodes:
-            by_task[int(task_index[first_row[e]])].append(e)
-    for members in by_task.values():
-        rng.shuffle(members)
-    chosen, tasks = [], sorted(by_task)
-    while len(chosen) < limit:
-        progressed = False
-        for t in tasks:
-            if by_task[t] and len(chosen) < limit:
-                chosen.append(by_task[t].pop())
-                progressed = True
-        if not progressed:
-            break
-    return sorted(chosen)
+    timing = timing_for(source.fps)
+    store = DiskFeatures(out / "features", timing.stride)
+    manifest = []
+    started = time.time()
+    for done, value in enumerate(episodes, 1):
+        rows = source.rows(value)
+        episode_id = f"{source.repo_id}/{value}"
+        episode = episode_from_arrays(
+            episode_id, source.repo_id, units, rows.state, rows.action, rows.timestamp, hash_id, len(cameras)
+        )
+        keyframes = np.arange(0, len(rows.timestamp), timing.stride)
+        views = [encode(source.frames(value, name, rows.timestamp[keyframes])) for name in cameras]
+        store.save(episode_id, torch.stack(views, dim=1))
+        save_episode(episode, out / "episodes", list(cameras.values()))
+        manifest.append({"episode_id": episode_id, "source_index": int(value), "task_index": rows.task_index, "ticks": len(rows.timestamp)})
+        rate = done / max(time.time() - started, 1e-9)
+        log(f"[shard {shard}/{num_shards}] {done}/{len(episodes)} {episode_id}: {len(rows.timestamp)} ticks, {len(keyframes)} keyframes, {rate * 60:.1f} episodes/min")
+    return manifest
 
 
 def main():
@@ -94,11 +106,13 @@ def main():
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--expect-fps", type=float, default=None, help="fail unless the dataset has this rate")
-    parser.add_argument("--max-episodes", type=int, default=None, help="task-balanced subset")
+    parser.add_argument("--episodes-per-task", type=int, default=None, help="task-balanced subset; default all")
+    parser.add_argument("--block", type=int, default=10, help="consecutive episodes per selected block")
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch", type=int, default=32, help="frames per encoder call")
     args = parser.parse_args()
     if not 0 <= args.shard < args.num_shards:
         raise ValueError("--shard must be in [0, num_shards)")
@@ -110,18 +124,25 @@ def main():
         gripper_device_open=args.gripper_open,
         gripper_direction_verified=True,
     )
-
-    dataset = open_dataset(args.repo_id)
-    info_path = Path(dataset.root) / "meta" / "info.json"
-    info = json.loads(info_path.read_text(encoding="utf-8"))
-    fps = float(info["fps"])
-    if args.expect_fps is not None and fps != args.expect_fps:
-        raise ValueError(f"dataset has {fps} fps, expected {args.expect_fps}")
-    timing = timing_for(fps)
-    check_dataset_info(info_path, expected_fps=fps)
+    source = LeRobotV3Source(args.repo_id)
+    if args.expect_fps is not None and source.fps != args.expect_fps:
+        raise ValueError(f"dataset has {source.fps} fps, expected {args.expect_fps}")
+    timing = timing_for(source.fps)
+    check_dataset_info(source.meta_root / "meta" / "info.json", expected_fps=source.fps)
+    available = source.camera_keys()
     for name in cameras:
-        if f"observation.images.{name}" not in info["features"]:
-            raise ValueError(f"camera '{name}' is not in this dataset: {[k for k in info['features'] if k.startswith('observation.images.')]}")
+        if name not in available:
+            raise ValueError(f"camera '{name}' is not in this dataset: {available}")
+
+    if args.episodes_per_task is None:
+        selected = sorted(int(e) for e in source.episodes.index)
+    else:
+        selected = select_blocks(source, args.episodes_per_task, args.block, args.seed)
+    assignment = shard_of(source, selected, args.num_shards)
+    mine = [e for e in selected if assignment[e] == args.shard]
+    print(f"{source.fps:g} fps -> stride {timing.stride}; {len(selected)} episodes selected; shard {args.shard} has {len(mine)}", flush=True)
+
+    from robojepa_ttt.models.upstream import add_upstream_to_path
 
     add_upstream_to_path()
     from app.robo_jepa.utils import build_encoder
@@ -129,45 +150,18 @@ def main():
     encoder = build_encoder(version="v21", device=args.device, filename=args.encoder, use_proj=False, max_num_frames=64)
     hash_id = encoder_hash(args.encoder)
 
+    def encode(frames: np.ndarray) -> torch.Tensor:
+        return encode_frames(encoder, torch.from_numpy(frames), args.device, batch=args.batch)
+
     out = Path(args.out)
-    store = DiskFeatures(out / "features", timing.stride)
-    table = dataset.hf_dataset.with_format("numpy")
-    episode_index = np.asarray(table["episode_index"])
-    task_index = np.asarray(table["task_index"]) if "task_index" in table.column_names else None
-    selected = select_episodes(episode_index, task_index, args.max_episodes, args.seed)
-    mine = selected[args.shard :: args.num_shards]
-    print(f"{fps:g} fps -> stride {timing.stride}; {len(selected)} episodes selected, shard {args.shard} has {len(mine)}", flush=True)
-
-    meta = DatasetMeta(args.repo_id, fps, cameras, True, args.gripper_closed, args.gripper_open, hash_id)
+    meta = DatasetMeta(args.repo_id, source.fps, cameras, True, args.gripper_closed, args.gripper_open, hash_id)
     meta.notes.append("wrist view excluded" if 2 not in cameras.values() else "wrist view included")
+    meta.notes.append("read with robojepa_ttt.data.lerobot_v3, not the lerobot package")
     if args.shard == 0:
-        meta.save(out)  # identical on every shard; written once
-    manifest = []
-    for value in mine:
-        rows = np.flatnonzero(episode_index == value)
-        part = table.select(rows.tolist())
-        state = np.stack(part["observation.state"])
-        action = np.stack(part["action"])
-        timestamps = np.asarray(part["timestamp"], dtype=float).ravel()
-        episode_id = f"{args.repo_id}/{int(value)}"
-        episode = episode_from_arrays(episode_id, args.repo_id, units, state, action, timestamps, hash_id, len(cameras))
-
-        keyframes = rows[:: timing.stride]
-        images = {name: [] for name in cameras}
-        for i in keyframes:
-            item = dataset[int(i)]  # decodes every camera of this frame once
-            for name in cameras:
-                images[name].append(item[f"observation.images.{name}"])
-        views = []
-        for name in cameras:
-            frames = (torch.stack(images[name]).permute(0, 2, 3, 1).clamp(0, 1) * 255).to(torch.uint8)
-            views.append(encode_frames(encoder, frames, args.device))
-        store.save(episode_id, torch.stack(views, dim=1))
-        save_episode(episode, out / "episodes", list(cameras.values()))
-        task = int(task_index[rows[0]]) if task_index is not None else None
-        manifest.append({"episode_id": episode_id, "source_index": int(value), "task_index": task, "ticks": len(rows)})
-        print(f"{episode_id}: {len(rows)} ticks, {len(keyframes)} keyframes", flush=True)
+        meta.save(out)
+    manifest = prepare(source, mine, cameras, units, encode, hash_id, out, args.shard, args.num_shards, lambda m: print(m, flush=True))
     (out / f"manifest-{args.shard}-of-{args.num_shards}.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"shard {args.shard} done: {len(manifest)} episodes", flush=True)
 
 
 if __name__ == "__main__":

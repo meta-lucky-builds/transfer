@@ -59,28 +59,6 @@ def test_meta_round_trip_and_mixed_rates_are_refused(tmp_path):
         common_timing(legacy)
 
 
-def test_episode_selection_is_balanced_deterministic_and_shard_disjoint():
-    from prepare_lerobot import select_episodes
-
-    # 3 tasks with 60 / 30 / 10 episodes, 20 frames each.
-    sizes = [60, 30, 10]
-    episode_index, task_index, e = [], [], 0
-    for task, count in enumerate(sizes):
-        for _ in range(count):
-            episode_index += [e] * 20
-            task_index += [task] * 20
-            e += 1
-    episode_index, task_index = np.array(episode_index), np.array(task_index)
-    chosen = select_episodes(episode_index, task_index, 30, seed=1)
-    assert chosen == select_episodes(episode_index, task_index, 30, seed=1)
-    per_task = np.bincount([task_index[np.flatnonzero(episode_index == c)[0]] for c in chosen], minlength=3)
-    assert per_task.tolist() == [10, 10, 10]
-    shards = [chosen[i::4] for i in range(4)]
-    assert sorted(sum(shards, [])) == chosen and len(set(sum(shards, []))) == 30
-    assert len(select_episodes(episode_index, task_index, 95, seed=1)) == 95  # small task exhausted, others fill
-    assert select_episodes(episode_index, None, None, seed=1) == list(range(100))
-
-
 def test_episode_files_are_named_by_id_and_rewrites_replace(tmp_path):
     episode = Episode("user/data/7", "cal", "enc", 2, capacity=4)
     for n in range(10):
