@@ -239,4 +239,14 @@ class OfflineTrainer:
                 log(record)
             if self.stale >= self.config.patience_evaluations:
                 break
+        if self.update % self.config.validation_interval:
+            # The last updates since a validation would otherwise never be scored or saved.
+            score = validate(self.model) if self.dist.is_main else None
+            score = broadcast_object(score, self.dist)
+            if score < self.best:
+                self.best, self.stale = score, 0
+                self._save("best.pt")
+            self._save("latest.pt")
+            if log is not None and self.dist.is_main:
+                log({"update": self.update, "validation": score, "final": True})
         return {"updates": self.update, "best": self.best, "seconds": time.time() - started}

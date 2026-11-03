@@ -49,6 +49,12 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--microbatch", type=int, default=None)
     parser.add_argument("--feature-cache-gb", type=float, default=20.0)
+    parser.add_argument("--max-updates", type=int, default=None, help="override; with early stopping this is a ceiling")
+    parser.add_argument("--warmup-updates", type=int, default=None)
+    parser.add_argument("--curriculum", default=None, help="updates:horizon,... e.g. 250:2,400:5,200:10")
+    parser.add_argument("--validation-interval", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None, help="evaluations without improvement before stopping")
+    parser.add_argument("--validation-windows", type=int, default=64, help="fixed validation windows (kept on CPU)")
     args = parser.parse_args()
 
     dist = init_distributed()
@@ -57,6 +63,20 @@ def main():
     config = settings.offline
     if args.microbatch:
         config = replace(config, microbatch=args.microbatch)
+    overrides = {}
+    if args.max_updates:
+        overrides["max_updates"] = args.max_updates
+    if args.warmup_updates is not None:
+        overrides["warmup_updates"] = args.warmup_updates
+    if args.curriculum:
+        overrides["curriculum"] = tuple(tuple(int(v) for v in part.split(":")) for part in args.curriculum.split(","))
+    if args.validation_interval:
+        overrides["validation_interval"] = args.validation_interval
+    if args.patience:
+        overrides["patience_evaluations"] = args.patience
+    config = replace(config, **overrides)
+    if max(h for _, h in config.curriculum) + 1 > config.sequence_frames:
+        raise ValueError("the longest curriculum horizon needs a longer sequence")
     timing = dataset_timing(settings, args.train, args.validation)
     spec = WindowSpec(
         frames=config.sequence_frames,
@@ -88,10 +108,10 @@ def main():
             spec,
             feature_cache(args.validation_features or args.features, spec.stride, budget // 4),
             config.microbatch,
-            device,
+            "cpu",  # kept off the GPU until used: at 2B one window is ~64 MB of features
             config.seed,
         )
-        fixed_validation = list(validation.ordered_batches(256))
+        fixed_validation = list(validation.ordered_batches(args.validation_windows))
         print(
             f"ranks {dist.world_size}, windows: train {train.total}, validation {validation.total}, "
             f"fixed validation batches {len(fixed_validation)}"
@@ -106,8 +126,14 @@ def main():
         print(f"resumed at update {trainer.update}")
 
     def validate(current) -> float:
-        errors = [rollout_errors(current, batch, 2, 5).mean() for batch in fixed_validation]
+        errors = []
+        for batch in fixed_validation:
+            on_device = {k: v.to(device) for k, v in batch.items()}
+            errors.append(rollout_errors(current, on_device, 2, 5).mean())
         return float(np.mean(errors))
+
+    if dist.is_main:
+        print(json.dumps({"config": {k: (list(v) if isinstance(v, tuple) else v) for k, v in vars(config).items()}}), flush=True)
 
     def log(record):
         if record["update"] % 20 == 0 or "validation" in record:
