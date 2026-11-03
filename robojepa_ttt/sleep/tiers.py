@@ -84,8 +84,20 @@ I1  An inactive slot has B == 0 exactly (LoRA lora_b, residual b_o weight and bi
     initialisation recorded by its generation counter.
 I2  No tier operation changes a tensor shape or the set of parameter names.
 I3  Every activation, reset, transplant, merge, compaction or tier-state load changes
-    ``model.version``, so version-checked KV caches (spec 13.3) are rebuilt.
+    ``model.version`` to a string unique in the process (also across clones), so
+    version-checked KV caches (spec 13.3) are rebuilt.
 Masks agree across every container of a (tier, regime): every projection and the residual.
+The forward pass reads the masks themselves (re-read every call on CPU; cached by tensor
+identity and version counter on accelerators, see `refresh_slot_cache`).
+
+Training rules
+--------------
+The wake tier is trained by the unchanged OnlineBuilder (C2; `TieredOnlineBuilder` only adds
+the check). A sleep-tier slot is trained only when named explicitly (`set_tier_trainable(...,
+slots={tier: [k]})`): written slots are frozen (sleep spec 3.1) and consolidation trains only
+the new slot k* (5.1 (b)). Transplant and merges stay inside one regime: the residual trunk
+is per regime, so a cross-regime copy would not be exact (cross-regime transfer needs
+distillation).
 
 A converted model's class is switched to `TieredAdaptedPredictor`, a subclass of
 `AdaptedPredictor` that adds no state. It refuses `set_trainable("offline")` (sleep spec
@@ -1739,6 +1751,9 @@ def merge_slots(model: nn.Module, tier: str, regime: Optional[int], slots: Seque
     rank (with uniform slot ranks this frees capacity only into a higher-rank slot). Residual:
     see _residual_merge_plan; residual='zero' resets the target's residual for distillation.
     release=True resets the source slots afterwards (wake source: zeroed, stays active).
+    release=False leaves the sources in place, so the merged knowledge counts TWICE in the
+    function until the caller resets them (the "update" step of paper 3.3 (c)); use it only
+    inside such a protocol, on a clone.
     """
     schema, config, r, sources, t_cfg = _merge_common(model, tier, regime, slots, into)
     t_tier, t_slot = into
@@ -1824,7 +1839,7 @@ class InputCovariance:
 def whitened_compaction(model: nn.Module, tier: str, regime: Optional[int], slots: Sequence[int],
                         covariances: Optional[Mapping[str, torch.Tensor]], *, into: Optional[int] = None,
                         residual: str = "exact", damping: float = 1e-4, energy_threshold: float = 0.98,
-                        release: bool = True, version: Optional[str] = None) -> MergeReport:
+                        release: bool = True, dry_run: bool = False, version: Optional[str] = None) -> MergeReport:
     """Lossy compaction of several slots of one sleep tier into one (sleep spec 6.2, Theorem 9.4, eq. S5).
 
     Per projection slice, with Delta = sum_k s_k B_k A_k over ``slots`` (float64) and
@@ -1839,7 +1854,11 @@ def whitened_compaction(model: nn.Module, tier: str, regime: Optional[int], slot
     covariances None means C = I (plain truncated SVD, Frobenius-optimal).
     Residual experts are nonlinear: merged exactly when unit supports are disjoint, else
     refused, or reset for distillation with residual='zero' (sleep spec 6.2).
-    The other slots are reset and released when release=True. Atomic until the writes.
+    The other slots are reset and released when release=True; with release=False they stay
+    active and the merged knowledge counts twice until the caller resets them. dry_run=True
+    computes and returns the report (the residual plan included) and writes nothing, does
+    not change the version, and so can rank candidate merges (rank_compaction_pairs).
+    Atomic until the writes.
     """
     _slotted(model, tier)
     target = min(slots) if into is None else into
@@ -1856,32 +1875,32 @@ def whitened_compaction(model: nn.Module, tier: str, regime: Optional[int], slot
                    for e in _slot_tensors(entries, tier, r, target) if e.role == "lora_a"}
     writes, reports = [], []
     for path, module in _lora_modules(model):
-        cov = None
-        if covariances is not None:
+        d_in = module.base.in_features
+        if covariances is None:
+            c = torch.eye(d_in, dtype=torch.float64)
+            eps = 0.0
+        else:
             if path not in covariances:
                 raise TierError(f"no input covariance for {path}")
-            cov = covariances[path].to(torch.float64)
+            cov = covariances[path].detach().to("cpu", torch.float64)
+            if cov.shape != (d_in, d_in):
+                raise TierError(f"covariance of {path} has shape {tuple(cov.shape)}, expected {(d_in, d_in)}")
+            if not bool(torch.isfinite(cov).all()):
+                raise TierError(f"covariance of {path} is not finite")
+            c = (cov + cov.T) / 2
+            eps = damping * float(torch.trace(c)) / d_in
+        # One eigendecomposition per projection input: every slice of a fused projection reads it.
+        evals, evecs = torch.linalg.eigh(c + eps * torch.eye(d_in, dtype=torch.float64))
+        if float(evals.min()) <= 0:
+            raise TierError(f"{path}: C_eps is not positive definite; increase damping")
+        root = (evecs * evals.sqrt()) @ evecs.T
+        inv_root = (evecs * evals.rsqrt()) @ evecs.T
         for index in range(len(module.slices)):
             deltas = [module.tiers[tier].deltas[r].slots[s][index] for s in sources]
             tgt = deltas[sources.index(target)]
             bs = [d.lora_b.detach().double().cpu() * d.scale for d in deltas]
             as_ = [d.lora_a.detach().double().cpu() for d in deltas]
             delta = sum(b @ a for b, a in zip(bs, as_))
-            d_in = delta.shape[1]
-            if cov is None:
-                c = torch.eye(d_in, dtype=torch.float64)
-                eps = 0.0
-            else:
-                if cov.shape != (d_in, d_in):
-                    raise TierError(f"covariance of {path} has shape {tuple(cov.shape)}, expected {(d_in, d_in)}")
-                c = (cov + cov.T) / 2
-                eps = damping * float(torch.trace(c)) / d_in
-            c_eps = c + eps * torch.eye(d_in, dtype=torch.float64)
-            evals, evecs = torch.linalg.eigh(c_eps)
-            if float(evals.min()) <= 0:
-                raise TierError(f"{path}: C_eps is not positive definite; increase damping")
-            root = (evecs * evals.sqrt()) @ evecs.T
-            inv_root = (evecs * evals.rsqrt()) @ evecs.T
             u, s_values, vh = torch.linalg.svd(delta @ root, full_matrices=False)
             k = config.rank
             total = float((s_values ** 2).sum())
@@ -1901,6 +1920,13 @@ def whitened_compaction(model: nn.Module, tier: str, regime: Optional[int], slot
                                        k, eta, total - retained, data_error,
                                        data_error / signal if signal > 0 else 0.0))
             writes += [(tgt.lora_a, new_a), (tgt.lora_b, new_b)]
+    min_eta = min((x.retained_energy for x in reports), default=1.0)
+    lossy = sum(1 for x in reports if x.retained_energy < energy_threshold)
+    worst = max((x.relative_error for x in reports), default=0.0)
+    if dry_run:
+        units = sum(len(u) for _, u in moves) if moves is not None else 0
+        return MergeReport(tier, r, (tier, target), tuple(sources), "whitened-svd", lossy == 0 and worst <= 1e-9,
+                           residual, units, min_eta, worst, lossy, reports)
     with torch.no_grad():
         for parameter, value in writes:
             parameter.copy_(value.to(parameter.device, parameter.dtype))
@@ -1912,11 +1938,33 @@ def whitened_compaction(model: nn.Module, tier: str, regime: Optional[int], slot
     if release and others:
         _reset_slots(model, tier, [r], others)
     _bump_version(model, f"compact-{tier}{target}", version)
-    min_eta = min((x.retained_energy for x in reports), default=1.0)
-    lossy = sum(1 for x in reports if x.retained_energy < energy_threshold)
-    worst = max((x.relative_error for x in reports), default=0.0)
     return MergeReport(tier, r, (tier, target), tuple(sources), "whitened-svd", lossy == 0 and worst <= 1e-9,
                        residual, moved, min_eta, worst, lossy, reports)
+
+
+def rank_compaction_pairs(model: nn.Module, tier: str, regime: Optional[int],
+                          covariances: Optional[Mapping[str, torch.Tensor]], *, damping: float = 1e-4,
+                          residual: str = "zero") -> list[tuple[float, tuple[int, int], MergeReport]]:
+    """Every pair of active slots of a sleep tier, ranked by the whitened energy a merge would
+    discard (sleep spec 4.4 step 2: "the pair with the smallest whitened residual energy").
+
+    Score = sum over projection slices of the discarded whitened energy sum_{i>r} sigma_i^2
+    of (S5), i.e. the layer-wise loss of Theorem 9.4 summed over layers. Nothing is written
+    (whitened_compaction dry runs). residual="zero" by default because trained residual
+    experts almost always share units and are merged by distillation (6.2). The oldest-pair
+    alternative of 4.4 is slots_by_age(model, tier, regime)[:2].
+    """
+    _slotted(model, tier)
+    r = _one_regime(model, regime)
+    active = active_slots(model, r)[tier]
+    ranked = []
+    for i, a in enumerate(active):
+        for b in active[i + 1:]:
+            report = whitened_compaction(model, tier, r, [a, b], covariances, residual=residual, damping=damping,
+                                         dry_run=True)
+            ranked.append((sum(x.whitened_error for x in report.slices), (a, b), report))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return ranked
 
 
 __all__ = [
@@ -1955,6 +2003,7 @@ __all__ = [
     "migrate_legacy_state",
     "model_schema",
     "model_tiers",
+    "rank_compaction_pairs",
     "refresh_slot_cache",
     "reset_tier",
     "resolve_tiers",

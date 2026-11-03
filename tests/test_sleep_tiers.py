@@ -40,6 +40,7 @@ from robojepa_ttt.sleep.tiers import (
     load_tier_state,
     merge_slots,
     migrate_legacy_state,
+    rank_compaction_pairs,
     model_tiers,
     refresh_slot_cache,
     reset_tier,
@@ -916,3 +917,25 @@ def test_compute_consolidate_update_cycle_on_roles(tmp_path, batch):
     assert all(torch.equal(p, frozen[n]) for n, p in builder.model.named_parameters() if n in frozen)
     hub.rollback("test")
     assert active_slots(hub.serving, 0)["slow"] == [] and check_invariants(hub.serving) == []
+
+
+def test_compaction_dry_run_writes_nothing_and_ranks_pairs_by_discarded_energy(batch):
+    """Sleep spec 4.4 step 2: prefer the pair whose merge discards the least whitened energy."""
+    model = tiered(ARCHIVE)
+    fill(model, "slow", activate_slot(model, "slow"), seed=1, residual=False)
+    duplicate = activate_slot(model, "slow")
+    transplant(model, ("slow", 0, 0), ("slow", 0, duplicate))  # same function: merging 0 and 1 is lossless
+    fill(model, "slow", activate_slot(model, "slow"), seed=2, residual=False)
+    covariances = collect(model, [batch])
+    state, version = tier_state(model), model.version
+    dry = whitened_compaction(model, "slow", 0, [0, 2], covariances, residual="zero", dry_run=True)
+    assert tier_state(model) == state and model.version == version
+    ranked = rank_compaction_pairs(model, "slow", 0, covariances)
+    assert tier_state(model) == state and model.version == version
+    assert [pair for _, pair, _ in ranked][0] == (0, 1) and ranked[0][0] == pytest.approx(0.0, abs=1e-12)
+    assert all(score > 0 for score, pair, _ in ranked[1:])
+    real = whitened_compaction(model.clone_role(), "slow", 0, [0, 2], covariances, residual="zero")
+    assert [x.whitened_error for x in dry.slices] == pytest.approx([x.whitened_error for x in real.slices])
+    before = run(model, batch)
+    whitened_compaction(model, "slow", 0, list(ranked[0][1]), covariances, residual="exact")
+    assert relative(run(model, batch), before) <= 1e-6 and free_slots(model, "slow") == [1]
