@@ -151,7 +151,7 @@ if want eval && ! done_marker eval; then
   say "evaluate B0 (zero adapters) against B1 on the untouched test split"
   python scripts/evaluate_b0_b1.py --predictor-config "$PRED_CONFIG" --weights "$WEIGHTS" --units "$DATA/units.json" \
     --servo "$DATA/servo.json" --episodes "$SPLITS/test/episodes" --features "$DATA/features" \
-    --adapters "$RUN/b1/best.pt" --device "$DEVICE" | tee "$RUN/b0_vs_b1.json"
+    --adapters "$RUN/b1/best.pt" --device "$DEVICE" "${SET[@]}" | tee "$RUN/b0_vs_b1.json"
   python - "$RUN/belief/report.json" <<'EOF'
 import json, sys
 report = json.load(open(sys.argv[1]))

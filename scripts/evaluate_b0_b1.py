@@ -32,9 +32,10 @@ def main():
     parser.add_argument("--context", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--batch", type=int, default=2)
+    parser.add_argument("--settings", default=None, help="the settings file training used")
     args = parser.parse_args()
 
-    settings = load_settings()
+    settings = load_settings(args.settings) if args.settings else load_settings()
     timing = dataset_timing(settings, args.episodes)
     spec = WindowSpec(frames=args.context + args.horizon, stride=timing.stride, tick_s=timing.tick_s, history_ticks=timing.history_ticks)
     episodes, view_ids = load_episodes(args.episodes)

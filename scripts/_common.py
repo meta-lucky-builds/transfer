@@ -67,7 +67,8 @@ def dataset_timing(settings, *directories) -> DatasetTiming:
     validated or tested at another.
     """
     timing = common_timing(*directories, default=yaml_timing(settings))
-    print(f"timing: {timing.fps:g} fps, {timing.stride} ticks per macro step, {timing.history_ticks} history ticks")
+    # stderr: scripts print JSON results on stdout, which must stay parseable.
+    print(f"timing: {timing.fps:g} fps, {timing.stride} ticks per macro step, {timing.history_ticks} history ticks", file=sys.stderr)
     return timing
 
 
