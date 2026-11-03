@@ -90,6 +90,7 @@ def main():
     parser.add_argument("--validation-interval", type=int, default=None)
     parser.add_argument("--patience", type=int, default=None, help="evaluations without improvement before stopping")
     parser.add_argument("--validation-windows", type=int, default=64, help="fixed validation windows (kept on CPU)")
+    parser.add_argument("--seed", type=int, default=None, help="adapter init, data and context sampling; default: YAML seed")
     parser.add_argument("--no-checkpointing", action="store_true",
                         help="keep activations instead of recomputing them: ~25-30%% faster, more memory")
     args = parser.parse_args()
@@ -101,6 +102,8 @@ def main():
     if args.microbatch:
         config = replace(config, microbatch=args.microbatch)
     overrides = {}
+    if args.seed is not None:
+        overrides["seed"] = args.seed
     if args.max_updates:
         overrides["max_updates"] = args.max_updates
     if args.warmup_updates is not None:
@@ -154,6 +157,9 @@ def main():
             f"fixed validation batches per rank ~{len(fixed_validation)}"
         )
 
+    # Seed adapter initialisation (LoRA A, residual) so runs are reproducible; rank 0's
+    # values are broadcast to all ranks by OfflineTrainer.
+    torch.manual_seed(config.seed)
     model = build_model(
         args.predictor_config, args.weights, load_units(args.units), load_servo(args.servo), settings, device, checkpointing=not args.no_checkpointing,
         timing=timing,

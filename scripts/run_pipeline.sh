@@ -33,6 +33,10 @@ B1_WARMUP="${B1_WARMUP:-100}"
 B1_CURRICULUM="${B1_CURRICULUM:-500:2,1000:5,500:10}"
 B1_VAL_INTERVAL="${B1_VAL_INTERVAL:-250}"
 B1_PATIENCE="${B1_PATIENCE:-4}"
+# Independent B1 seeds on separate machines measure whether a gain is more than luck (spec 19.4).
+B1_SEED="${B1_SEED:-}"
+SEED_FLAG=(); [ -n "$B1_SEED" ] && SEED_FLAG=(--seed "$B1_SEED")
+B1_DIR="${B1_DIR:-$RUN/b1${B1_SEED:+_seed$B1_SEED}}"
 BELIEF_MAX_UPDATES="${BELIEF_MAX_UPDATES:-4000}"
 BELIEF_VAL_INTERVAL="${BELIEF_VAL_INTERVAL:-500}"
 STAGES="${STAGES:-setup prepare split units servo smoke train belief eval}"
@@ -155,11 +159,11 @@ if want train && ! done_marker train; then
   # B1 alone on every GPU. Nothing else shares a GPU with a data-parallel rank: every rank
   # waits for the slowest one at each step, so one shared GPU would slow all of them.
   say "train B1: data parallel on all $NGPU GPUs, microbatch $MICRO each, nothing else on them"
-  torchrun --standalone --nproc_per_node "$NGPU" scripts/train_offline.py "${B1_ARGS[@]}" --out "$RUN/b1" --microbatch "$MICRO" "${CKPT_FLAG[@]}" \
+  torchrun --standalone --nproc_per_node "$NGPU" scripts/train_offline.py "${B1_ARGS[@]}" --out "$B1_DIR" --microbatch "$MICRO" "${CKPT_FLAG[@]}" "${SEED_FLAG[@]}" \
     --max-updates "$B1_MAX_UPDATES" --warmup-updates "$B1_WARMUP" --curriculum "$B1_CURRICULUM" \
     --validation-interval "$B1_VAL_INTERVAL" --patience "$B1_PATIENCE" > "$RUN/logs/b1.log" 2>&1 \
     || { tail -40 "$RUN/logs/b1.log"; echo "STOP: B1 training failed"; exit 1; }
-  echo "B1 finished: $(grep -o "{'updates'.*" "$RUN/logs/b1.log" | tail -1)"
+  echo "B1 finished: $(grep -o "{'updates'.*" "$RUN/logs/b1.log" | tail -1)  (in $B1_DIR)"
   grep -h "peak_gpu_gb" "$RUN/logs/b1.log" || true
   mark train
 fi
@@ -167,25 +171,29 @@ fi
 run_eval() {
   python scripts/evaluate_b0_b1.py --predictor-config "$PRED_CONFIG" --weights "$WEIGHTS" --units "$DATA/units.json" \
     --servo "$DATA/servo.json" --episodes "$SPLITS/test/episodes" --features "$DATA/features" \
-    --adapters "$RUN/b1/best.pt" --device "$DEVICE" --batch "$EVAL_BATCH" "${SET[@]}" > "$RUN/b0_vs_b1.json" 2> "$RUN/logs/eval.log"
+    --adapters "$B1_DIR/best.pt" --device "$DEVICE" --batch "$EVAL_BATCH" "${SET[@]}" > "$B1_DIR/b0_vs_b1.json" 2> "$RUN/logs/eval.log"
 }
 
 if want belief && ! done_marker belief; then
   # Independent jobs, one per GPU: B0-vs-B1 evaluation on GPU 0, belief seeds on the others.
   # Spec 19.4 asks for at least three independently trained seeds.
-  SEEDS=$(( NGPU > 1 ? NGPU - 1 : 1 ))
-  say "belief: shared sketch, then $SEEDS seeds on GPUs 1..$SEEDS, with evaluation on GPU 0 alongside"
+  # Evaluation shares the stage only when a trained B1 exists; otherwise every GPU trains a seed.
+  EVAL_ALONGSIDE=0
+  if want eval && ! done_marker eval && [ -f "$B1_DIR/best.pt" ] && [ "$NGPU" -gt 1 ]; then EVAL_ALONGSIDE=1; fi
+  SEEDS=$(( EVAL_ALONGSIDE == 1 ? NGPU - 1 : NGPU ))
+  FIRST_SEED_GPU=$EVAL_ALONGSIDE
+  say "belief: shared sketch, then $SEEDS seeds$([ "$EVAL_ALONGSIDE" = 1 ] && echo ', with evaluation on GPU 0 alongside')"
   CUDA_VISIBLE_DEVICES=0 python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/belief_sketch" \
     --sketch-path "$RUN/sketch.pt" --sketch-only > "$RUN/logs/sketch.log" 2>&1 \
     || { tail -30 "$RUN/logs/sketch.log"; echo "STOP: sketch fit failed"; exit 1; }
   eval_pid=""
-  if want eval && ! done_marker eval; then
+  if [ "$EVAL_ALONGSIDE" = 1 ]; then
     CUDA_VISIBLE_DEVICES=0 run_eval &
     eval_pid=$!
   fi
   pids=()
   for k in $(seq 1 "$SEEDS"); do
-    gpu=$(( NGPU > 1 ? k : 0 ))
+    gpu=$(( NGPU > 1 ? (FIRST_SEED_GPU + k - 1) % NGPU : 0 ))
     CUDA_VISIBLE_DEVICES=$gpu python scripts/train_belief.py "${BELIEF_ARGS[@]}" --out "$RUN/belief_seed$k" --seed $((100 + k)) \
       --sketch-path "$RUN/sketch.pt" --calibration "$SPLITS/calibration/episodes" \
       --max-updates "$BELIEF_MAX_UPDATES" --validation-interval "$BELIEF_VAL_INTERVAL" > "$RUN/logs/belief_seed$k.log" 2>&1 &
@@ -209,9 +217,12 @@ if want eval && ! done_marker eval; then
   mark eval
 fi
 
-if [ -f "$RUN/b0_vs_b1.json" ] && [ -f "$RUN/belief/report.json" ]; then
-  say "results"
-  cat "$RUN/b0_vs_b1.json"
+if [ -f "$B1_DIR/b0_vs_b1.json" ]; then
+  say "results: B0 vs B1 ($B1_DIR)"
+  cat "$B1_DIR/b0_vs_b1.json"
+fi
+if [ -f "$RUN/belief/report.json" ]; then
+  say "results: belief"
   python scripts/select_belief_seed.py --run "$RUN" --summary
 fi
 say "pipeline finished; results in $RUN"

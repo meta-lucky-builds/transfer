@@ -98,7 +98,7 @@ def test_full_pipeline_on_cpu(tmp_path):
     assert (run / "b1" / "best.pt").exists() and (run / "b1" / "latest.pt").exists()
     records = [json.loads(line) for line in b1_log.splitlines() if line.startswith('{"update"')]
     assert records and all(np.isfinite(r.get("loss", r.get("validation", 0.0))) for r in records)
-    report = json.loads((run / "b0_vs_b1.json").read_text())
+    report = json.loads((run / "b1" / "b0_vs_b1.json").read_text())
     assert {"h1", "h2", "h5"} <= set(report)
     belief = json.loads((run / "belief" / "report.json").read_text())
     assert (run / "sketch.pt").exists() and (run / "belief_seed1" / "belief.pt").exists()
