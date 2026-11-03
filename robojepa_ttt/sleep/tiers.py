@@ -97,6 +97,7 @@ every legacy snapshot. A legacy snapshot is migrated explicitly with
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -106,7 +107,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Union
 import torch
 import torch.nn as nn
 
-from ..learning.online_builder import build_optimizer
+from ..learning.online_builder import OnlineBuilder, build_optimizer
 from ..models.adapted_predictor import AdaptedPredictor
 from ..models.lora import LoRADelta, LoRALinear
 from ..models.token_residual import TokenResidual, _RegimeResidual
@@ -351,20 +352,40 @@ def _read_mask(mask: torch.Tensor, where: str) -> tuple[int, ...]:
 
 
 def _cached_active(owner: nn.Module, cache_key, masks: Sequence[tuple[str, torch.Tensor]]) -> dict[str, tuple[int, ...]]:
-    """Active slots per tier, re-read only when a mask may have changed.
+    """Active slots per tier for the forward pass: the masks are the only authority (C1).
 
-    The key is (id, version counter, data pointer) of every mask: in-place writes
-    (copy_ in load_adapter_state, fill_ here) bump the counter, and deepcopy or a device
-    move changes id or pointer. One host read per change, none per forward.
+    CPU masks are read on every call (a few floats, no device sync), so no write path can
+    leave a stale plan. Masks on an accelerator would cost one host sync per projection per
+    forward, so their plan is cached and re-read only when a mask may have changed. The
+    cache key holds the mask tensors themselves (identity, so a freed tensor's id cannot be
+    reused by a new one), their autograd version counters and data pointers: in-place
+    writes (copy_ in load_adapter_state and load_state_dict, the writes in this module) bump
+    the counter, deepcopy and device moves change the tensor. KNOWN LIMIT: a write through
+    ``.data`` bypasses the version counter; after one, call `refresh_slot_cache`.
     """
-    key = tuple((id(m), m._version, m.data_ptr()) for _, m in masks)
+    if all(m.device.type == "cpu" for _, m in masks):
+        return {name: _read_mask(m, f"{type(owner).__name__}[{cache_key}].{name}") for name, m in masks}
     cache = owner.__dict__.setdefault("_tier_mask_cache", {})
     hit = cache.get(cache_key)
-    if hit is not None and hit[0] == key:
+    if hit is not None and len(hit[0]) == len(masks) and all(
+        held is m and version == m._version and pointer == m.data_ptr()
+        for (held, version, pointer), (_, m) in zip(hit[0], masks)
+    ):
         return hit[1]
     result = {name: _read_mask(m, f"{type(owner).__name__}[{cache_key}].{name}") for name, m in masks}
-    cache[cache_key] = (key, result)
+    cache[cache_key] = (tuple((m, m._version, m.data_ptr()) for _, m in masks), result)
     return result
+
+
+def refresh_slot_cache(model: nn.Module) -> None:
+    """Drop every cached forward plan, so the next forward re-reads the masks.
+
+    Needed only after a mask write that bypasses autograd's version counter (``p.data[...]
+    = v``) on an accelerator; every write path of this module and of load_adapter_state is
+    tracked automatically.
+    """
+    for module in model.modules():
+        module.__dict__.pop("_tier_mask_cache", None)
 
 
 class TieredLoRALinear(LoRALinear):
@@ -540,6 +561,40 @@ class TieredAdaptedPredictor(AdaptedPredictor):
         validate_state(self, state)
         super().load_adapter_state(state, version)
 
+    @property
+    def sleep_tiers(self) -> tuple[TierConfig, ...]:
+        """All tiers, fastest first, offline last (same as model_tiers(self))."""
+        return self.sleep_schema.tiers
+
+
+class TieredOnlineBuilder(OnlineBuilder):
+    """The unchanged OnlineBuilder, plus a check that it trains exactly the fast tier (C2).
+
+    Under C2 the plain OnlineBuilder already selects the fast tier only, so this class adds
+    no behaviour: it refuses construction (and reset_optimizer) when the model is not tiered
+    or when set_trainable("online") would reach anything but tier_parameters(model, fast,
+    model.regime). Use it for the fresh post-sleep builder (C7, sleep spec 10.4).
+    """
+
+    def __init__(self, model, reference, config, seed: int = 0):
+        _check_online_selection(model)
+        super().__init__(model, reference, config, seed)
+
+    def reset_optimizer(self) -> None:
+        _check_online_selection(self.model)
+        super().reset_optimizer()
+
+
+def _check_online_selection(model) -> None:
+    if not isinstance(model, TieredAdaptedPredictor):
+        raise TierError("TieredOnlineBuilder needs a tiered model")
+    groups = model.set_trainable("online")
+    online = [id(p) for g in groups.values() for p in g]
+    fast = [id(p) for p in tier_parameters(model, model.sleep_schema.fast.name, model.regime)]
+    model.set_trainable("none")
+    if online != fast:
+        raise TierStateError("set_trainable('online') does not select exactly the fast tier (C2)")
+
 
 def is_tiered(model: nn.Module) -> bool:
     return isinstance(model, TieredAdaptedPredictor)
@@ -708,15 +763,26 @@ def _b_is_zero(entries: list[SlotEntry]) -> bool:
     return not any(bool(e.parameter.detach().any()) for e in entries if e.role in _B_ROLES)
 
 
+_EDIT_COUNTER = itertools.count(1)
+
+
 def _bump_version(model: nn.Module, operation: str, version: Optional[str] = None) -> None:
-    """Invariant I3 (sleep spec 4.3): every slot event yields a new version string."""
+    """Invariant I3 (sleep spec 4.3): every slot event yields a new version string.
+
+    The counter is process-wide, not per model: two clones of one model that make the
+    same edit get different versions, so a KV cache built by one is refused by the other
+    (spec 13.3) even when the edits are identical. Versions persisted by VersionStore are
+    the store's own names, set by load_adapter_state; these generated ones live in memory
+    only, where process-wide uniqueness is what the cache check needs. An explicit
+    ``version`` is the caller's responsibility (it must be new, I3).
+    """
     if version is not None:
+        if not isinstance(version, str) or not version:
+            raise TierError("version must be a non-empty string")
         model.version = version
         return
-    count = getattr(model, "_tier_edit_count", 0) + 1
-    model._tier_edit_count = count
     root = str(getattr(model, "version", "base")).split("~")[0]
-    model.version = f"{root}~{operation}.{count}"
+    model.version = f"{root}~{operation}.{next(_EDIT_COUNTER)}"
 
 
 # =============================================================================== conversion
@@ -1023,6 +1089,15 @@ def slots_by_age(model: nn.Module, tier: str, regime: Optional[int] = None) -> l
     return sorted(active, key=lambda s: int(bank.slot_birth[s]))
 
 
+def free_slots(model: nn.Module, tier: str, regime: Optional[int] = None) -> list[int]:
+    """Inactive slots of a sleep tier in one regime, lowest first. len() is F_r of sleep spec 4.4
+    (pressure when F_r <= rho, the reserve; trigger T-e of 10.1)."""
+    config = _slotted(model, tier)
+    r = _one_regime(model, regime)
+    active = set(active_slots(model, r)[tier])
+    return [s for s in range(config.slots) if s not in active]
+
+
 def _set_active(model: nn.Module, entries: list[SlotEntry], tier: str, regime: int, slot: int, value: bool) -> None:
     with torch.no_grad():
         for e in _masks(entries, tier, regime):
@@ -1078,6 +1153,7 @@ def reset_tier(
     *,
     slots: Optional[Sequence[int]] = None,
     allow_offline: bool = False,
+    active_after: Optional[int] = None,
     version: Optional[str] = None,
 ) -> None:
     """Synaptic pruning (paper 3.3 step (c)(b), sleep spec 5.1 (c)): zero contribution, exactly.
@@ -1089,6 +1165,10 @@ def reset_tier(
     "all" means every regime; slots None means every slot of the tier. Resetting the offline
     tier erases the stage-3 knowledge and needs allow_offline=True. Optimizer moments of the
     reset tensors are stale: rebuild the optimizer (spec 12.1, sleep spec F8).
+
+    active_after, if given, is the caller's expectation of the number of active slots of the
+    tier in each selected regime after the reset (1 for the wake tier, which never
+    deactivates). A mismatch is refused before anything is written.
     """
     schema = model_schema(model)
     config = schema.tier(tier)
@@ -1097,7 +1177,13 @@ def reset_tier(
     chosen = list(range(config.slots)) if slots is None else sorted(set(slots))
     if any(isinstance(s, bool) or not isinstance(s, int) or not 0 <= s < config.slots for s in chosen):
         raise TierError(f"slots {slots} out of range for tier {tier}")
-    _reset_slots(model, tier, _resolve_regimes(model, regime), chosen)
+    regimes = _resolve_regimes(model, regime)
+    if active_after is not None:
+        for r in regimes:
+            after = 1 if tier == schema.fast.name else len(set(active_slots(model, r)[tier]) - set(chosen))
+            if after != active_after:
+                raise TierError(f"reset of {tier} r{r} would leave {after} active slots, caller expected {active_after}")
+    _reset_slots(model, tier, regimes, chosen)
     _bump_version(model, f"reset-{tier}", version)
 
 
@@ -1167,8 +1253,17 @@ def tier_parameters(model: nn.Module, tier: str, regime: int = 0, slot: Optional
 
 
 def set_tier_trainable(model: nn.Module, tiers: Sequence[str], regime: Optional[int] = None, *,
-                       components: Sequence[str] = ("lora", "residual"), online: bool = True) -> dict[str, list[nn.Parameter]]:
-    """Freeze every parameter, then unfreeze the active slots of ``tiers`` only.
+                       components: Sequence[str] = ("lora", "residual"),
+                       slots: Optional[Mapping[str, Sequence[int]]] = None, all_active: bool = False,
+                       online: bool = True) -> dict[str, list[nn.Parameter]]:
+    """Freeze every parameter, then unfreeze the chosen slots of ``tiers`` only.
+
+    The wake tier contributes its single slot. A sleep tier needs an explicit choice,
+    because its slots are frozen once written (sleep spec 3.1) and consolidation trains only
+    the new slot k* (5.1 (b)): pass ``slots={tier: [k, ...]}`` (each slot must be active;
+    an inactive slot is never handed to an optimizer, 4.3), or ``all_active=True`` to train
+    every active slot of the tier (e.g. a refinement that deliberately revises the bank).
+    Anything else is refused rather than silently training old memories.
 
     Returns groups keyed "<tier>.<component>" for learning/online_builder.build_optimizer
     (see tier_learning_rates and build_tier_optimizer). Every tier slot's residual part is
@@ -1176,19 +1271,49 @@ def set_tier_trainable(model: nn.Module, tiers: Sequence[str], regime: Optional[
     accepted for compatibility and changes nothing. Refuses when nothing would be trainable.
     """
     del online
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+    schema = model_schema(model)
     r = _one_regime(model, regime)
-    groups: dict[str, list[nn.Parameter]] = {}
+    slots = dict(slots or {})
+    unknown = set(slots) - set(tiers)
+    if unknown:
+        raise TierError(f"slots given for tiers {sorted(unknown)} that are not in tiers={list(tiers)}")
+    plan: list[tuple[str, list[Optional[int]]]] = []
     for tier in tiers:
+        config = schema.tier(tier)
+        if tier == schema.fast.name:
+            if tier in slots and list(slots[tier]) != [0]:
+                raise TierError("the wake tier has only slot 0")
+            plan.append((tier, [None]))
+            continue
+        active = active_slots(model, r)[tier]
+        if tier in slots:
+            chosen = list(slots[tier])
+            bad = [s for s in chosen if isinstance(s, bool) or not isinstance(s, int) or not 0 <= s < config.slots]
+            if bad or len(set(chosen)) != len(chosen):
+                raise TierError(f"slots {chosen} invalid for tier {tier}")
+            inactive = [s for s in chosen if s not in active]
+            if inactive:
+                raise TierError(f"slots {inactive} of {tier} r{r} are inactive: an inactive slot is never trained "
+                                "(sleep spec 4.3); activate_slot first")
+            plan.append((tier, sorted(chosen)))
+        elif all_active:
+            plan.append((tier, sorted(active)))
+        else:
+            raise TierError(f"sleep tier {tier}: name the slots to train (slots={{'{tier}': [k]}}) or pass "
+                            "all_active=True; written slots are frozen (sleep spec 3.1, 5.1 (b))")
+    for component in components:
+        if component not in ("lora", "residual"):
+            raise TierError(f"component must be 'lora' or 'residual', got {component!r}")
+    groups: dict[str, list[nn.Parameter]] = {}
+    for tier, chosen in plan:
         for component in components:
-            if component not in ("lora", "residual"):
-                raise TierError(f"component must be 'lora' or 'residual', got {component!r}")
-            params = tier_parameters(model, tier, r, None, component)
+            params = [p for slot in chosen for p in tier_parameters(model, tier, r, slot, component)]
             if params:
                 groups[f"{tier}.{component}"] = params
     if not groups:
-        raise TierError(f"tiers {list(tiers)} have no active slot in regime {r}: nothing to train")
+        raise TierError(f"tiers {list(tiers)} have nothing to train in regime {r}")
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
     for params in groups.values():
         for parameter in params:
             parameter.requires_grad_(True)
@@ -1212,14 +1337,15 @@ def tier_learning_rates(groups: Mapping[str, list], lora_lr: Union[float, Mappin
 
 
 def build_tier_optimizer(model: nn.Module, tiers: Sequence[str], lora_lr, residual_lr, regime: Optional[int] = None, *,
+                         slots: Optional[Mapping[str, Sequence[int]]] = None, all_active: bool = False,
                          weight_decay: float = 0.0, betas=(0.9, 0.95), eps: float = 1e-8):
     """AdamW over the active slots of ``tiers`` via learning/online_builder.build_optimizer.
 
     Defaults follow sleep spec 5.4 (betas 0.9/0.95) and 5.3.6 (no weight decay on a slot:
     decay toward zero would pull a transplanted slot off the function it carries). Returns
-    (optimizer, groups).
+    (optimizer, groups). ``slots`` / ``all_active`` as in set_tier_trainable.
     """
-    groups = set_tier_trainable(model, tiers, regime)
+    groups = set_tier_trainable(model, tiers, regime, slots=slots, all_active=all_active)
     rates = tier_learning_rates(groups, lora_lr, residual_lr)
     return build_optimizer(groups, rates, weight_decay, betas, eps), groups
 
@@ -1454,7 +1580,9 @@ def transplant(model: nn.Module, src: tuple, dst: tuple, *, version: Optional[st
     """Exact copy of one slot's function into an empty active slot (sleep spec Theorem 9.2, mode M1).
 
     src = (tier, regime) for the wake tier, or (tier, regime, slot); dst = (tier, regime, slot)
-    of a sleep tier, which must be active and empty (B == 0), and of rank >= the source rank.
+    of a sleep tier in the SAME regime (the residual trunk is per regime, so a cross-regime
+    copy would not be exact and is refused), active and empty (B == 0), of rank >= the
+    source rank.
     A_dst = [A_src; R] keeps the slot's own seeded rows R (random, not zero, so the padded
     rank stays trainable, Theorem 9.2 remark), B_dst = (scale_src / scale_dst) [B_src 0].
     Residual expert (modulation_out, b_o) copied exactly. The source is not modified: reset
@@ -1471,6 +1599,12 @@ def transplant(model: nn.Module, src: tuple, dst: tuple, *, version: Optional[st
         raise TierError(f"slot {d_slot!r} out of range for {d_tier}")
     if (s_tier, s_regime, s_slot) == (d_tier, d_regime, d_slot):
         raise TierError("source and destination are the same slot")
+    if s_regime != d_regime:
+        # The LoRA delta would copy exactly, but each regime's residual has its own trunk
+        # (a_o, modulation hidden layers) and regime embedding, so the residual expert would
+        # compute a different function in the other regime: not Theorem 9.2.
+        raise TierError(f"transplant across regimes ({s_regime} -> {d_regime}) is not exact: the residual trunk is "
+                        "per regime. Transfer across regimes needs distillation")
     s_cfg = schema.tier(s_tier)
     if d_cfg.rank < s_cfg.rank:
         raise TierError(f"destination rank {d_cfg.rank} < source rank {s_cfg.rank}: not exact; use whitened_compaction")
@@ -1805,6 +1939,7 @@ __all__ = [
     "TierStateError",
     "TieredAdaptedPredictor",
     "TieredLoRALinear",
+    "TieredOnlineBuilder",
     "TieredRegimeResidual",
     "TransplantReport",
     "activate_slot",
@@ -1813,12 +1948,14 @@ __all__ = [
     "build_tier_optimizer",
     "check_invariants",
     "convert_to_tiered",
+    "free_slots",
     "is_tiered",
     "load_tier_state",
     "merge_slots",
     "migrate_legacy_state",
     "model_schema",
     "model_tiers",
+    "refresh_slot_cache",
     "reset_tier",
     "resolve_tiers",
     "schema_payload",

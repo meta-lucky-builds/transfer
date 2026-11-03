@@ -20,6 +20,7 @@ from robojepa_ttt.models.upstream import build_predictor
 from robojepa_ttt.sleep.tiers import (
     OFFLINE,
     SCHEMA_KEY,
+    DEFAULT_TIERS,
     InputCovariance,
     TierConfig,
     TierError,
@@ -28,16 +29,19 @@ from robojepa_ttt.sleep.tiers import (
     TierStateError,
     TieredAdaptedPredictor,
     TieredLoRALinear,
+    TieredOnlineBuilder,
     activate_slot,
     active_slots,
     build_tier_optimizer,
     check_invariants,
     convert_to_tiered,
+    free_slots,
     is_tiered,
     load_tier_state,
     merge_slots,
     migrate_legacy_state,
     model_tiers,
+    refresh_slot_cache,
     reset_tier,
     resolve_tiers,
     schema_payload,
@@ -454,7 +458,9 @@ def test_gradients_are_isolated_per_tier(batch):
     slot = activate_slot(model, "slow")
     fill(model, "fast")
     fill(model, "slow", slot, seed=1)
-    groups = set_tier_trainable(model, ["slow"])
+    with pytest.raises(TierError):  # written slow slots are frozen: the slot must be named
+        set_tier_trainable(model, ["slow"])
+    groups = set_tier_trainable(model, ["slow"], slots={"slow": [slot]})
     assert set(groups) == {"slow.lora", "slow.residual"}
     model.rollout(batch, 3, 2).sum().backward()
     with_grad = {n for n, p in model.named_parameters() if p.grad is not None and p.grad.abs().sum() > 0}
@@ -675,7 +681,8 @@ def test_kv_generation_matches_full_forward_with_several_active_tiers(context, h
 def test_tier_optimizer_steps_only_the_selected_slot():
     model = tiered()
     slot = activate_slot(model, "slow")
-    optimizer, groups = build_tier_optimizer(model, ["slow"], 1e-2, 1e-2)
+    activate_slot(model, "slow")  # an older active slot that must stay frozen
+    optimizer, groups = build_tier_optimizer(model, ["slow"], 1e-2, 1e-2, slots={"slow": [slot]})
     assert all(g["weight_decay"] == 0.0 for g in optimizer.param_groups)
     before = {n: p.detach().clone() for n, p in model.named_parameters()}
     model.rollout(make_batch(), 3, 2).sum().backward()
@@ -683,7 +690,9 @@ def test_tier_optimizer_steps_only_the_selected_slot():
     changed = {n for n, p in model.named_parameters() if not torch.equal(p, before[n])}
     assert changed and changed <= set(tier_named_parameters(model, "slow", 0, slot))
     with pytest.raises(TierError):
-        set_tier_trainable(tiered(), ["slow"])  # no active slot: nothing to train
+        set_tier_trainable(tiered(), ["slow"], slots={"slow": [0]})  # inactive slot: never trained
+    with pytest.raises(TierError):
+        set_tier_trainable(tiered(), ["slow"], all_active=True)  # no active slot: nothing to train
 
 
 def test_low_precision_keeps_counters_exact(batch):
@@ -722,3 +731,188 @@ def test_delta_norms_follow_contributions():
     fill(model, "fast")
     assert tier_delta_norms(model)["fast"] > 0
     assert SCHEMA_KEY in model.adapter_state()
+
+
+# ---------------------------------------------------------------------------- review additions
+
+
+def shapes(model):
+    return {n: (tuple(p.shape), p.dtype) for n, p in model.named_parameters()}
+
+
+def test_i2_no_operation_changes_a_name_shape_or_dtype(batch):
+    model = tiered(ARCHIVE)
+    reference = shapes(model)
+    fill(model, "fast")
+    slot = activate_slot(model, "slow")
+    transplant(model, ("fast", 0), ("slow", 0, slot))
+    reset_tier(model, "fast")
+    fill(model, "slow", activate_slot(model, "slow"), seed=2, residual=False)
+    assert shapes(model) == reference
+    whitened_compaction(model, "slow", 0, [0, 1], collect(model, [batch]), residual="zero")
+    assert shapes(model) == reference
+    merge_slots(model, "slow", 0, [0], ("archive", activate_slot(model, "archive")), residual="zero")
+    load_tier_state(model, tier_state(model))
+    assert shapes(model) == reference and check_invariants(model) == []
+    assert set(model.adapter_state()) == set(tiered(ARCHIVE).adapter_state())
+
+
+def test_cross_regime_transplant_is_refused_because_the_residual_trunk_is_per_regime():
+    model = two_regime_model()
+    convert_to_tiered(model, TIERS)
+    fill(model, "fast")
+    assert not torch.equal(model.residual.regimes[0].a_o.weight, model.residual.regimes[1].a_o.weight)
+    slot = activate_slot(model, "slow", regime=1)
+    state = tier_state(model)
+    with pytest.raises(TierError, match="across regimes"):
+        transplant(model, ("fast", 0), ("slow", 1, slot))
+    assert tier_state(model) == state
+
+
+def test_versions_are_unique_across_clones_so_caches_never_cross(batch):
+    """I3 with roles: identical edits on two clones still yield different versions."""
+    model = tiered()
+    a, b = model.clone_role(), model.clone_role()
+    activate_slot(a, "slow")
+    activate_slot(b, "slow")
+    assert a.version != b.version and tier_state(a) == tier_state(b)
+    actions, states = a.sequence_inputs(batch, 3, 1)
+    prefix = a.prime_context(batch["features"][:, :2], actions[:, :2], states[:, :2], batch["view_ids"])
+    with pytest.raises(StaleCacheError):
+        b.step_cached(batch["features"][:, 2:3], actions[:, 2:3], states[:, 2:3], batch["view_ids"],
+                      b.encode_commands(batch, 3)[:, 2:3], prefix, 2)
+    with pytest.raises(TierError):
+        activate_slot(a, "slow", version="")
+
+
+def test_masks_are_the_only_authority_even_when_written_through_data(batch):
+    """C1: the forward reads the mask parameters; no stale plan survives any write path."""
+    model = tiered()
+    slot = activate_slot(model, "slow")
+    fill(model, "slow", slot)
+    with_slot = run(model, batch)
+    masks = [e.parameter for e in slot_entries(model) if e.role == "slot_active" and e.tier == "slow"]
+    for mask in masks:
+        mask.data[slot] = 0.0  # bypasses the autograd version counter
+    without = run(model, batch)
+    assert not torch.equal(without, with_slot)
+    for mask in masks:
+        mask.data[slot] = 1.0
+    refresh_slot_cache(model)
+    assert torch.equal(run(model, batch), with_slot)
+    clone = model.clone_role()  # a deepcopied plan cache must not leak into the clone
+    reset_tier(clone, "slow")
+    assert not torch.equal(run(clone, batch), with_slot) and torch.equal(run(model, batch), with_slot)
+
+
+def test_free_slots_and_reset_expectations():
+    model = tiered()
+    assert free_slots(model, "slow") == [0, 1, 2]
+    activate_slot(model, "slow")
+    activate_slot(model, "slow")
+    assert free_slots(model, "slow") == [2]
+    state = tier_state(model)
+    with pytest.raises(TierError):
+        reset_tier(model, "slow", slots=[0], active_after=0)  # one slot would stay active
+    assert tier_state(model) == state
+    reset_tier(model, "slow", slots=[0], active_after=1)
+    reset_tier(model, "fast", active_after=1)
+    with pytest.raises(TierError):
+        reset_tier(model, "fast", active_after=0)  # the wake tier never deactivates
+    with pytest.raises(TierError):
+        free_slots(model, "fast")
+    assert free_slots(model, "slow") == [0, 2]
+
+
+def test_spec_default_tiers_convert_exactly(batch):
+    """Sleep spec 4.1 / 14: fast rank 8 alpha 16, slow 8 slots of rank 8 alpha 16 per regime.
+    The fixture's stage-3 rank is 4, so the offline tier takes rank 4 and the fast rank differs
+    from the legacy rank: harmless, because the fast tier starts at zero."""
+    slow = DEFAULT_TIERS[1]
+    assert (DEFAULT_TIERS[0].rank, DEFAULT_TIERS[0].alpha, DEFAULT_TIERS[0].slots) == (8, 16.0, 1)
+    assert (slow.name, slow.rank, slow.alpha, slow.slots) == ("slow", 8, 16.0, 8)
+    model = make_model()
+    set_adapters_nonzero(model)
+    before = run(model, batch)
+    report = convert_to_tiered(model, probe=(batch, 3, 2))
+    assert report.probe_relative_error == 0.0 and torch.equal(run(model, batch), before)
+    assert [(t.name, t.rank) for t in model_tiers(model)] == [("fast", 8), ("slow", 8), (OFFLINE, 4)]
+    assert model.sleep_tiers == model_tiers(model)
+    for expected in range(8):
+        assert activate_slot(model, "slow") == expected
+    with pytest.raises(TierFullError):
+        activate_slot(model, "slow")
+    assert torch.equal(run(model, batch), before)
+
+
+def test_conversion_is_exact_under_bf16_autocast():
+    if not torch.amp.autocast_mode.is_autocast_available("cpu"):
+        pytest.skip("no cpu autocast")
+    model = make_model(amp_dtype=torch.bfloat16)
+    set_adapters_nonzero(model)
+    batch = make_batch()
+    before = run(model, batch)
+    report = convert_to_tiered(model, TIERS, probe=(batch, 3, 2), tolerance=1e-2)
+    assert report.probe_relative_error == 0.0 and torch.equal(run(model, batch), before)
+    slot = activate_slot(model, "slow")
+    assert torch.equal(run(model, batch), before)
+    fill(model, "fast", seed=3)
+    with_fast = run(model, batch)
+    transplant(model, ("fast", 0), ("slow", 0, slot))
+    reset_tier(model, "fast")
+    assert relative(run(model, batch), with_fast) <= 1e-2  # sleep spec 9.2 bf16 tolerance
+
+
+def test_merge_from_the_wake_tier_into_an_archive_slot_is_exact(batch):
+    model = tiered(ARCHIVE)
+    fill(model, "fast", seed=8)
+    before = run(model, batch)
+    target = activate_slot(model, "archive")
+    report = merge_slots(model, "fast", 0, [0], ("archive", target))
+    assert report.exact and report.residual == "exact"
+    assert active_slots(model, 0)["fast"] == [0] and not any(
+        p.any() for n, p in tier_named_parameters(model, "fast", 0).items() if n.endswith("lora_b") or ".b_o." in n)
+    assert relative(run(model, batch), before) <= 1e-6 and check_invariants(model) == []
+
+
+def test_tiered_online_builder_refuses_anything_but_the_fast_tier():
+    legacy = make_model()
+    with pytest.raises(TierError):
+        TieredOnlineBuilder(legacy, legacy.clone_role(), OnlineConfig())
+    model = tiered()
+    builder = TieredOnlineBuilder(model, model.clone_role(), OnlineConfig())
+    trained = {id(p) for g in builder.optimizer.param_groups for p in g["params"]}
+    assert trained == {id(p) for p in tier_parameters(model, "fast", 0)}
+    builder.reset_optimizer()
+
+
+def test_compute_consolidate_update_cycle_on_roles(tmp_path, batch):
+    """Paper 3.3 / sleep spec 5.1 with M1 at the tier level: the teacher (serving) is never
+    written; the student gets the fast tier transplanted into a fresh slot and the fast tier
+    reset; a fresh builder then trains only the new fast tier; rollback restores the slot map."""
+    model = tiered()
+    hub = ModelHub(model, VersionStore(tmp_path), PromotionConfig(), shadow=False)
+    fill(hub.serving, "fast", seed=11)  # stands in for validated fast knowledge
+    teacher_state = tier_state(hub.serving)
+    expected = run(hub.serving, batch)
+
+    student = hub.serving.clone_role()
+    slot = activate_slot(student, "slow")
+    report = transplant(student, ("fast", 0), ("slow", 0, slot))
+    reset_tier(student, "fast")
+    assert report.max_relative_error <= 1e-12 and relative(run(student, batch), expected) <= 1e-6
+    assert tier_state(hub.serving) == teacher_state, "the teacher is untouched"
+
+    hub.challenger_snapshot = student.snapshot("sleep-00001", parent=hub.serving.version)
+    hub.challenger = hub.serving.clone_role()
+    hub.challenger.load_adapter_state(hub.challenger_snapshot.state, "sleep-00001")
+    hub.promote()
+    assert active_slots(hub.serving, 0)["slow"] == [slot]
+    builder = TieredOnlineBuilder(hub.serving.clone_role(), hub.serving.clone_role(),
+                                  OnlineConfig(warmup_updates=1, lora_lr=1e-2, residual_lr=1e-2))
+    frozen = {n: p.detach().clone() for n, p in builder.model.named_parameters() if n not in
+              tier_named_parameters(builder.model, "fast", 0)}
+    assert builder.update(make_batch(frames=6), [True, False], context=3).status == "ok"
+    assert all(torch.equal(p, frozen[n]) for n, p in builder.model.named_parameters() if n in frozen)
+    hub.rollback("test")
+    assert active_slots(hub.serving, 0)["slow"] == [] and check_invariants(hub.serving) == []
