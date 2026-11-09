@@ -1512,7 +1512,7 @@ Required high-value tests:
 - Parameter promotion rebuilds belief/cache, and rollback preserves the actual action log.
 - Disconnect, expiry, duplicate, reorder, and wrong-start-condition rejection in a hardware-free harness before the arm moves.
 
-The companion `verify_math.py` checks selected mathematical invariants without neural dependencies. Passing it does not validate the learned model, robot I/O, network implementation, or physical safety.
+The companion `verify_math.py` (not yet included in this repository) checks selected mathematical invariants without neural dependencies. Passing it does not validate the learned model, robot I/O, network implementation, or physical safety.
 
 ## 22. Recommended build order
 
