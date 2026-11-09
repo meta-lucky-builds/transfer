@@ -17,3 +17,9 @@ The code in [`robojepa_ttt/`](robojepa_ttt/), [`scripts/`](scripts/) and [`tests
 [`third_party/robo_jepa/`](third_party/robo_jepa/) is a copy of [facebookresearch/robo_jepa](https://github.com/facebookresearch/robo_jepa) at commit `f93106f5`,
 under its own [CC BY-NC-SA 4.0 license](third_party/robo_jepa/LICENSE), which does not allow commercial use.
 The Python files and paper copies in [`sources/`](sources/) are taken from upstream and from the papers, and keep their original licenses and terms.
+
+## Related work
+
+- [RoboJEPA: Scaling Robotic Latent World Models](https://arxiv.org/abs/2610.10515) (Zholus et al., 7 Oct 2026) is the base model.
+- [JEPA-TTT](https://arxiv.org/abs/2610.00722) is the source of the persistent replay-based adaptation.
+- [SO-101 Bench](https://arxiv.org/abs/2610.36420) (27 Oct 2026) is a simulated benchmark for the same arm.
